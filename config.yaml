@@ -1,0 +1,9 @@
+
+llm:
+  api_key: ""
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-chat"
+
+agent:
+  max_tool_calls: 3
+  timeout_seconds: 60
