@@ -3,6 +3,7 @@ package diagnosis
 import (
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -26,9 +27,6 @@ const (
 )
 
 // EvidenceLink connects a hypothesis to a collected observation.
-//
-// EvidenceID references an item in the evidence store.
-// Reason explains why the observation matters to this hypothesis.
 type EvidenceLink struct {
 	EvidenceID string           `json:"evidence_id"`
 	Relation   EvidenceRelation `json:"relation"`
@@ -63,13 +61,17 @@ func (h Hypothesis) Validate() error {
 		return fmt.Errorf("invalid hypothesis status: %q", h.Status)
 	}
 
-	if h.Confidence < 0 || h.Confidence > 1 {
-		return errors.New("hypothesis confidence must be between 0 and 1")
+	if math.IsNaN(h.Confidence) ||
+		math.IsInf(h.Confidence, 0) ||
+		h.Confidence < 0 ||
+		h.Confidence > 1 {
+		return errors.New("hypothesis confidence must be finite and between 0 and 1")
 	}
 
 	seen := make(map[string]struct{}, len(h.Evidence))
 	for _, link := range h.Evidence {
-		if strings.TrimSpace(link.EvidenceID) == "" {
+		link.EvidenceID = strings.TrimSpace(link.EvidenceID)
+		if link.EvidenceID == "" {
 			return errors.New("evidence link ID cannot be empty")
 		}
 		if strings.TrimSpace(link.Reason) == "" {

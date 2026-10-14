@@ -3,6 +3,7 @@ package diagnosis
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -17,7 +18,6 @@ var (
 )
 
 // Manager manages hypotheses and their evidence relationships.
-//
 // Manager is safe for concurrent use.
 type Manager struct {
 	mu       sync.RWMutex
@@ -33,23 +33,11 @@ func NewManager(store evidence.Store) *Manager {
 	}
 }
 
-// Add validates and registers a new hypothesis.
-// All evidence references must already exist in the evidence store.
-func (m *Manager) Add(h Hypothesis) error {
-	if m == nil {
-		return errors.New("hypothesis manager cannot be nil")
-	}
-	if err := h.Validate(); err != nil {
-		return err
-	}
+// validateEvidenceReferences verifies that all linked evidence exists.
+func (m *Manager) validateEvidenceReferences(h Hypothesis) error {
 	if len(h.Evidence) > 0 && m.evidence == nil {
 		return ErrEvidenceStoreNil
 	}
-
-	h.ID = strings.TrimSpace(h.ID)
-	h.Title = strings.TrimSpace(h.Title)
-	h.Description = strings.TrimSpace(h.Description)
-	h.Evidence = cloneLinks(h.Evidence)
 
 	for _, link := range h.Evidence {
 		if _, err := m.evidence.Get(link.EvidenceID); err != nil {
@@ -61,6 +49,26 @@ func (m *Manager) Add(h Hypothesis) error {
 			)
 		}
 	}
+	return nil
+}
+
+// Add validates and registers a new hypothesis.
+func (m *Manager) Add(h Hypothesis) error {
+	if m == nil {
+		return errors.New("hypothesis manager cannot be nil")
+	}
+	if err := h.Validate(); err != nil {
+		return err
+	}
+
+	h.ID = strings.TrimSpace(h.ID)
+	h.Title = strings.TrimSpace(h.Title)
+	h.Description = strings.TrimSpace(h.Description)
+	h.Evidence = cloneLinks(h.Evidence)
+
+	if err := m.validateEvidenceReferences(h); err != nil {
+		return err
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -70,6 +78,36 @@ func (m *Manager) Add(h Hypothesis) error {
 	}
 	if _, exists := m.items[h.ID]; exists {
 		return fmt.Errorf("%w: %s", ErrHypothesisExists, h.ID)
+	}
+
+	m.items[h.ID] = h
+	return nil
+}
+
+// Update atomically replaces an existing hypothesis.
+// All evidence references must already exist in the evidence store.
+func (m *Manager) Update(h Hypothesis) error {
+	if m == nil {
+		return errors.New("hypothesis manager cannot be nil")
+	}
+	if err := h.Validate(); err != nil {
+		return err
+	}
+
+	h.ID = strings.TrimSpace(h.ID)
+	h.Title = strings.TrimSpace(h.Title)
+	h.Description = strings.TrimSpace(h.Description)
+	h.Evidence = cloneLinks(h.Evidence)
+
+	if err := m.validateEvidenceReferences(h); err != nil {
+		return err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, exists := m.items[h.ID]; !exists {
+		return fmt.Errorf("%w: %s", ErrHypothesisNotFound, h.ID)
 	}
 
 	m.items[h.ID] = h
@@ -119,7 +157,7 @@ func (m *Manager) List() []Hypothesis {
 	return result
 }
 
-// AddEvidence links an existing evidence item to an existing hypothesis.
+// AddEvidence links a new evidence item to an existing hypothesis.
 func (m *Manager) AddEvidence(
 	hypothesisID string,
 	link EvidenceLink,
@@ -173,7 +211,6 @@ func (m *Manager) AddEvidence(
 }
 
 // UpdateAssessment updates the status and confidence of a hypothesis.
-// Confidence must be between 0 and 1, inclusive.
 func (m *Manager) UpdateAssessment(
 	id string,
 	status Status,
@@ -189,8 +226,11 @@ func (m *Manager) UpdateAssessment(
 		return fmt.Errorf("invalid hypothesis status: %q", status)
 	}
 
-	if confidence < 0 || confidence > 1 {
-		return errors.New("hypothesis confidence must be between 0 and 1")
+	if math.IsNaN(confidence) ||
+		math.IsInf(confidence, 0) ||
+		confidence < 0 ||
+		confidence > 1 {
+		return errors.New("hypothesis confidence must be finite and between 0 and 1")
 	}
 
 	id = strings.TrimSpace(id)
