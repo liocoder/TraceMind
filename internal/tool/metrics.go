@@ -13,7 +13,29 @@ func (m *MockMetricsQuery) Name() string {
 }
 
 func (m *MockMetricsQuery) Description() string {
-	return "Query simulated service health metrics, including latency, error rate, connection pool usage, and CPU utilization."
+	return "Query simulated service health metrics, including latency, error rate, connection pool usage, and CPU utilization. Supported services: order-service, payment-service, database, api-gateway."
+}
+
+// normalizeServiceName 将常见中文名称和别名转换为标准服务名。
+func normalizeServiceName(service string) string {
+	service = strings.ToLower(strings.TrimSpace(service))
+
+	switch service {
+	case "订单服务", "订单", "order", "order_service":
+		return "order-service"
+
+	case "支付服务", "支付", "payment", "payment_service":
+		return "payment-service"
+
+	case "数据库", "订单数据库", "mysql", "order-db", "order_db":
+		return "database"
+
+	case "网关", "api网关", "gateway", "api_gateway":
+		return "api-gateway"
+
+	default:
+		return service
+	}
 }
 
 func (m *MockMetricsQuery) Execute(
@@ -29,7 +51,7 @@ func (m *MockMetricsQuery) Execute(
 		return Result{}, fmt.Errorf("service must be a non-empty string")
 	}
 
-	service = strings.ToLower(strings.TrimSpace(service))
+	service = normalizeServiceName(service)
 
 	var content string
 
@@ -40,10 +62,10 @@ func (m *MockMetricsQuery) Execute(
 	case "payment-service":
 		content = "service=payment-service, p95_latency_ms=3200, error_rate=12.6%, connection_pool_usage=76%, cpu_usage=38%, status=degraded"
 
-	case "database", "mysql", "order-db":
+	case "database":
 		content = "service=database, p95_latency_ms=35, error_rate=0.1%, connection_pool_usage=45%, cpu_usage=51%, status=healthy"
 
-	case "gateway", "api-gateway":
+	case "api-gateway":
 		content = "service=api-gateway, p95_latency_ms=2100, error_rate=7.9%, upstream_timeout_count=126, status=degraded"
 
 	default:

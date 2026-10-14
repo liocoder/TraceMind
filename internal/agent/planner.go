@@ -2,8 +2,6 @@ package agent
 
 import (
 	"errors"
-	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/liocoder/TraceMind/internal/diagnosis"
@@ -15,24 +13,19 @@ var (
 	ErrNoUsefulAction   = errors.New("no useful investigation action found")
 )
 
-// ToolCandidate describes a tool that the planner may select.
-// It intentionally does not depend on the concrete tool registry.
 type ToolCandidate struct {
 	Name        string
 	Description string
 }
 
-// PlanningInput contains the current investigation context.
 type PlanningInput struct {
-	Incident string
-
+	Incident      string
 	Evidence      []evidence.Evidence
 	Hypotheses    []diagnosis.Hypothesis
 	Tools         []ToolCandidate
 	ToolCallCount map[string]int
 }
 
-// InvestigationPlan describes the next investigation action.
 type InvestigationPlan struct {
 	ToolName            string `json:"tool_name"`
 	Rationale           string `json:"rationale"`
@@ -40,227 +33,145 @@ type InvestigationPlan struct {
 	ExpectedObservation string `json:"expected_observation"`
 }
 
-// Planner selects the next investigation action.
 type Planner interface {
 	Plan(input PlanningInput) (InvestigationPlan, error)
 }
 
-// RulePlanner makes deterministic, explainable investigation decisions.
 type RulePlanner struct{}
 
 func NewPlanner() *RulePlanner {
 	return &RulePlanner{}
 }
 
-type scoredTool struct {
-	tool   ToolCandidate
-	score  int
-	reason string
-}
-
-// Plan selects a tool based on the incident, collected evidence,
-// current hypotheses, and previous tool usage.
 func (p *RulePlanner) Plan(input PlanningInput) (InvestigationPlan, error) {
-	if p == nil {
-		return InvestigationPlan{}, errors.New("planner cannot be nil")
-	}
-
-	incident := strings.TrimSpace(input.Incident)
-	if incident == "" {
-		return InvestigationPlan{}, errors.New("incident cannot be empty")
-	}
 	if len(input.Tools) == 0 {
 		return InvestigationPlan{}, ErrNoAvailableTools
 	}
 
-	tools := make([]ToolCandidate, 0, len(input.Tools))
-	seen := make(map[string]struct{}, len(input.Tools))
-
+	toolByName := make(map[string]ToolCandidate, len(input.Tools))
 	for _, candidate := range input.Tools {
-		candidate.Name = strings.TrimSpace(candidate.Name)
-		candidate.Description = strings.TrimSpace(candidate.Description)
-
-		if candidate.Name == "" {
-			continue
-		}
-		if _, exists := seen[candidate.Name]; exists {
-			continue
-		}
-
-		seen[candidate.Name] = struct{}{}
-		tools = append(tools, candidate)
+		toolByName[candidate.Name] = candidate
 	}
 
-	if len(tools) == 0 {
-		return InvestigationPlan{}, ErrNoAvailableTools
-	}
+	hasMetrics := false
+	hasLogs := false
 
-	scored := make([]scoredTool, 0, len(tools))
-	for _, candidate := range tools {
-		score, reason := scoreTool(candidate, input)
-		used := input.ToolCallCount[candidate.Name]
-
-		// Prefer tools that have not yet been called, all else equal.
-		score -= used * 3
-
-		scored = append(scored, scoredTool{
-			tool:   candidate,
-			score:  score,
-			reason: reason,
-		})
-	}
-
-	sort.SliceStable(scored, func(i, j int) bool {
-		if scored[i].score != scored[j].score {
-			return scored[i].score > scored[j].score
-		}
-		return scored[i].tool.Name < scored[j].tool.Name
-	})
-
-	best := scored[0]
-	if best.score < 0 {
-		return InvestigationPlan{}, ErrNoUsefulAction
-	}
-
-	targetID := selectTargetHypothesis(input.Hypotheses)
-	expected := expectedObservation(best.tool, best.reason)
-
-	return InvestigationPlan{
-		ToolName:            best.tool.Name,
-		Rationale:           best.reason,
-		TargetHypothesisID:  targetID,
-		ExpectedObservation: expected,
-	}, nil
-}
-
-func scoreTool(candidate ToolCandidate, input PlanningInput) (int, string) {
-	name := strings.ToLower(candidate.Name)
-	description := strings.ToLower(candidate.Description)
-	toolText := name + " " + description
-
-	score := 0
-	reasons := make([]string, 0, 3)
-
-	// With no observations yet, start with logs when available.
-	if len(input.Evidence) == 0 {
-		if containsAny(toolText, "log", "日志", "error", "错误") {
-			score += 10
-			reasons = append(reasons, "尚无调查证据，优先查询日志以定位异常线索")
-		}
-		if containsAny(toolText, "metric", "指标", "monitor", "监控") {
-			score += 6
-			reasons = append(reasons, "尚无调查证据，可先获取服务运行指标")
-		}
-	}
-
-	observations := strings.ToLower(input.Incident)
 	for _, item := range input.Evidence {
-		observations += " " + strings.ToLower(item.Source)
-		observations += " " + strings.ToLower(item.Content)
-	}
+		source := strings.ToLower(item.Source)
+		content := strings.ToLower(item.Content)
 
-	if containsAny(observations,
-		"connection pool", "连接池", "pool exhausted", "连接耗尽") {
-		if containsAny(toolText, "metric", "指标", "connection", "连接池") {
-			score += 12
-			reasons = append(reasons, "已有线索指向连接池问题，优先核查连接池及等待指标")
+		if strings.Contains(source, "metrics") &&
+			!strings.Contains(content, "no simulated metrics available") &&
+			!strings.Contains(content, "status=unknown") {
+			hasMetrics = true
+		}
+
+		if strings.Contains(source, "log") {
+			hasLogs = true
 		}
 	}
 
-	if containsAny(observations,
-		"timeout", "超时", "502", "error", "异常", "failed", "失败") {
-		if containsAny(toolText, "log", "日志", "error", "错误") {
-			score += 8
-			reasons = append(reasons, "当前故障存在错误或超时，查询日志有助于确认具体异常")
-		}
-		if containsAny(toolText, "metric", "指标", "latency", "延迟") {
-			score += 5
-			reasons = append(reasons, "当前故障涉及错误或超时，指标可用于判断影响范围")
+	incident := strings.ToLower(input.Incident)
+	hasLatencyIssue := containsAny(incident,
+		"latency", "p99", "p95", "延迟", "耗时", "变慢")
+	hasErrorIssue := containsAny(incident,
+		"502", "500", "timeout", "error", "异常", "超时", "错误")
+	hasDependencyClue := containsAny(incident,
+		"下游", "依赖", "payment", "database", "数据库", "支付")
+
+	if !hasMetrics {
+		if candidate, ok := toolByName["query_metrics"]; ok {
+			return InvestigationPlan{
+				ToolName:            candidate.Name,
+				Rationale:           "先获取服务运行指标，确认延迟、错误率和连接池使用情况。",
+				ExpectedObservation: "获得服务健康指标，判断是否存在连接池饱和、错误率升高或其他资源瓶颈。",
+			}, nil
 		}
 	}
 
+	if !hasLogs {
+		if candidate, ok := toolByName["search_logs"]; ok {
+			return InvestigationPlan{
+				ToolName:            candidate.Name,
+				Rationale:           "通过错误日志定位超时和异常发生的具体环节。",
+				ExpectedObservation: "确认是否出现请求超时、连接池耗尽或下游依赖异常等日志线索。",
+			}, nil
+		}
+	}
+
+	var targetID string
 	for _, hypothesis := range input.Hypotheses {
 		if hypothesis.Status == diagnosis.StatusRefuted {
 			continue
 		}
-
-		hypothesisText := strings.ToLower(
-			hypothesis.Title + " " + hypothesis.Description,
-		)
-
-		if containsAny(hypothesisText,
-			"connection pool", "连接池", "database", "数据库") &&
-			containsAny(toolText, "metric", "指标", "database", "数据库", "connection", "连接") {
-			score += 4
-			reasons = append(reasons, "该工具有助于验证数据库或连接池相关假设")
-		}
-
-		if containsAny(hypothesisText,
-			"downstream", "下游", "payment", "支付") &&
-			containsAny(toolText, "log", "日志", "trace", "链路", "dependency", "依赖") {
-			score += 4
-			reasons = append(reasons, "该工具有助于验证下游依赖相关假设")
+		if hypothesis.ID != "" {
+			targetID = hypothesis.ID
+			break
 		}
 	}
 
-	reason := "该工具与当前调查上下文的匹配度最高"
-	if len(reasons) > 0 {
-		reason = strings.Join(uniqueStrings(reasons), "；")
+	if hasDependencyClue || evidenceMentionsDependency(input.Evidence) {
+		if candidate, ok := toolByName["query_metrics"]; ok &&
+			input.ToolCallCount[candidate.Name] < 2 {
+			return InvestigationPlan{
+				ToolName:            candidate.Name,
+				Rationale:           "现有证据提示可能存在下游依赖问题，需要进一步核对相关服务的健康状态。",
+				TargetHypothesisID:  targetID,
+				ExpectedObservation: "检查相关依赖的延迟和错误率，判断下游劣化是否可能导致订单服务连接池耗尽。",
+			}, nil
+		}
 	}
 
-	return score, reason
+	if !hasLogs {
+		if candidate, ok := toolByName["search_logs"]; ok {
+			return InvestigationPlan{
+				ToolName:            candidate.Name,
+				Rationale:           "当前缺少日志证据，需要定位异常发生的具体环节。",
+				TargetHypothesisID:  targetID,
+				ExpectedObservation: "获取与超时、连接池或下游调用有关的错误日志。",
+			}, nil
+		}
+	}
+
+	for _, candidate := range input.Tools {
+		if input.ToolCallCount[candidate.Name] == 0 {
+			return InvestigationPlan{
+				ToolName:            candidate.Name,
+				Rationale:           "补充尚未执行的调查手段，验证现有诊断是否存在遗漏。",
+				TargetHypothesisID:  targetID,
+				ExpectedObservation: "获取新的独立证据，以验证或排除现有根因假设。",
+			}, nil
+		}
+	}
+
+	if hasLatencyIssue || hasErrorIssue {
+		return InvestigationPlan{}, ErrNoUsefulAction
+	}
+
+	return InvestigationPlan{}, ErrNoUsefulAction
 }
 
-func selectTargetHypothesis(hypotheses []diagnosis.Hypothesis) string {
-	candidates := make([]diagnosis.Hypothesis, 0, len(hypotheses))
-	for _, h := range hypotheses {
-		if h.Status == diagnosis.StatusRefuted {
-			continue
-		}
-		candidates = append(candidates, h)
-	}
-
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].Confidence != candidates[j].Confidence {
-			return candidates[i].Confidence > candidates[j].Confidence
-		}
-		return candidates[i].ID < candidates[j].ID
-	})
-
-	if len(candidates) == 0 {
-		return ""
-	}
-	return candidates[0].ID
-}
-
-func expectedObservation(tool ToolCandidate, rationale string) string {
-	description := strings.TrimSpace(tool.Description)
-	if description == "" {
-		return fmt.Sprintf("获取工具 %q 返回的调查信息，用于验证当前判断", tool.Name)
-	}
-	return fmt.Sprintf("通过“%s”获取新的观测，以检验：%s", description, rationale)
-}
-
-func containsAny(text string, keywords ...string) bool {
+func containsAny(value string, keywords ...string) bool {
 	for _, keyword := range keywords {
-		if strings.Contains(text, strings.ToLower(keyword)) {
+		if strings.Contains(value, strings.ToLower(keyword)) {
 			return true
 		}
 	}
 	return false
 }
 
-func uniqueStrings(values []string) []string {
-	seen := make(map[string]struct{}, len(values))
-	result := make([]string, 0, len(values))
-
-	for _, value := range values {
-		if _, exists := seen[value]; exists {
-			continue
+func evidenceMentionsDependency(items []evidence.Evidence) bool {
+	for _, item := range items {
+		content := strings.ToLower(item.Content)
+		if containsAny(content,
+			"payment-service",
+			"downstream",
+			"下游",
+			"依赖服务",
+			"latency elevated",
+		) {
+			return true
 		}
-		seen[value] = struct{}{}
-		result = append(result, value)
 	}
-
-	return result
+	return false
 }

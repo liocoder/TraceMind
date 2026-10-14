@@ -3,27 +3,29 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/liocoder/TraceMind/internal/diagnosis"
 	"github.com/liocoder/TraceMind/internal/evidence"
 	"github.com/liocoder/TraceMind/internal/llm"
 	"github.com/liocoder/TraceMind/internal/tool"
 )
 
-const MaxToolCalls = 3
-
 type Report struct {
-	Incident     string              `json:"incident"`
-	State        State               `json:"state"`
-	StateHistory []State             `json:"state_history"`
-	ToolCalls    int                 `json:"tool_calls"`
-	Summary      string              `json:"summary"`
-	Hypotheses   []string            `json:"hypotheses"`
-	Evidence     []evidence.Evidence `json:"evidence"`
+	Incident            string                 `json:"incident"`
+	State               State                  `json:"state"`
+	StateHistory        []State                `json:"state_history"`
+	ToolCalls           int                    `json:"tool_calls"`
+	Summary             string                 `json:"summary"`
+	Hypotheses          []string               `json:"hypotheses"`
+	Evidence            []evidence.Evidence    `json:"evidence"`
+	Plans               []InvestigationPlan    `json:"plans,omitempty"`
+	DiagnosisHypotheses []diagnosis.Hypothesis `json:"diagnosis_hypotheses,omitempty"`
 }
 
-// completionClient 抽象模型调用，便于在测试中使用模拟客户端。
 type completionClient interface {
 	Complete(
 		ctx context.Context,
@@ -35,20 +37,18 @@ type completionClient interface {
 type Runtime struct {
 	tools        *tool.Registry
 	client       completionClient
+	planner      Planner
 	maxToolCalls int
 }
 
-// NewRuntime 保持原有接口，正常运行时使用真实 LLM 客户端。
 func NewRuntime(
 	tools *tool.Registry,
 	clients ...*llm.Client,
 ) *Runtime {
 	var client completionClient
-
 	if len(clients) > 0 {
 		client = clients[0]
 	}
-
 	return newRuntime(tools, client)
 }
 
@@ -57,14 +57,22 @@ func newRuntime(
 	client completionClient,
 ) *Runtime {
 	return &Runtime{
-		tools:        tools,
-		client:       client,
-		maxToolCalls: MaxToolCalls,
+		tools:   tools,
+		client:  client,
+		planner: NewPlanner(),
 	}
 }
 
+func (r *Runtime) SetPlanner(planner Planner) {
+	if r != nil {
+		r.planner = planner
+	}
+}
+
+// SetMaxToolCalls 设置单次事件调查允许执行的最大工具调用次数。
+// 配置默认值由 config.Load() 统一负责。
 func (r *Runtime) SetMaxToolCalls(max int) {
-	if max > 0 {
+	if r != nil && max > 0 {
 		r.maxToolCalls = max
 	}
 }
@@ -74,20 +82,31 @@ func (r *Runtime) Run(
 	incident string,
 ) (*Report, error) {
 	incident = strings.TrimSpace(incident)
+
 	if incident == "" {
-		return nil, fmt.Errorf("incident description cannot be empty")
+		return nil, errors.New("incident description cannot be empty")
 	}
 	if r == nil {
-		return nil, fmt.Errorf("runtime cannot be nil")
+		return nil, errors.New("runtime cannot be nil")
 	}
 	if r.tools == nil {
-		return nil, fmt.Errorf("tool registry cannot be nil")
+		return nil, errors.New("tool registry cannot be nil")
 	}
 	if r.client == nil {
-		return nil, fmt.Errorf("LLM client is not configured")
+		return nil, errors.New("LLM client is not configured")
+	}
+	if r.planner == nil {
+		return nil, errors.New("planner is not configured")
 	}
 	if ctx == nil {
-		return nil, fmt.Errorf("context cannot be nil")
+		return nil, errors.New("context cannot be nil")
+	}
+
+	maxCalls := r.maxToolCalls
+	if maxCalls <= 0 {
+		return nil, errors.New(
+			"max tool calls is not configured: call SetMaxToolCalls with cfg.Agent.MaxToolCalls",
+		)
 	}
 
 	definitions, err := r.tools.ToLLMDefinitions()
@@ -95,27 +114,30 @@ func (r *Runtime) Run(
 		return nil, fmt.Errorf("build tool definitions: %w", err)
 	}
 
-	maxCalls := r.maxToolCalls
-	if maxCalls <= 0 {
-		maxCalls = MaxToolCalls
-	}
-
+	// 每次事件调查都创建独立的证据存储和假设管理器。
+	evidenceStore := evidence.NewStore()
+	diagnosisManager := diagnosis.NewManager(evidenceStore)
 	sm := NewStateMachine()
 
 	report := &Report{
-		Incident:   incident,
-		Hypotheses: []string{},
-		Evidence:   []evidence.Evidence{},
+		Incident:            incident,
+		Hypotheses:          []string{},
+		Evidence:            []evidence.Evidence{},
+		Plans:               []InvestigationPlan{},
+		DiagnosisHypotheses: []diagnosis.Hypothesis{},
 	}
 
-	// 必须先声明，后续 fail 闭包会读取该变量。
 	toolCallsUsed := 0
+	toolCallCount := make(map[string]int)
+
+	// 调查预算耗尽或没有有价值的调查动作后，只允许生成最终诊断。
+	forceFinal := false
+	finalPromptAdded := false
 
 	transition := func(next State) error {
 		if err := sm.Transition(next); err != nil {
 			return err
 		}
-
 		report.State = sm.Current()
 		report.StateHistory = sm.History()
 		return nil
@@ -126,8 +148,8 @@ func (r *Runtime) Run(
 			sm.Current() != StateFailed {
 			_ = transition(StateFailed)
 		}
-
 		report.ToolCalls = toolCallsUsed
+		report.DiagnosisHypotheses = diagnosisManager.List()
 		return report, err
 	}
 
@@ -135,14 +157,18 @@ func (r *Runtime) Run(
 		return fail(err)
 	}
 
-	systemPrompt := `You are TraceMind, an incident diagnosis agent.
+	systemPrompt := `You are TraceMind, an evidence-driven incident diagnosis agent.
 
 Investigate incidents using the available tools.
 Base conclusions on actual tool results. Never invent observations.
 Distinguish observed facts from hypotheses.
 Do not claim a root cause is confirmed unless the evidence supports it.
-Investigate downstream dependencies when the evidence suggests they may be involved.
+Investigate downstream dependencies when evidence suggests they may be involved.
 If evidence is insufficient, clearly state the uncertainty.
+
+Follow the investigation plan provided for each round.
+Only use the tool permitted by the current plan.
+If the evidence is sufficient, return a final diagnosis without calling tools.
 
 When finished, return valid JSON only:
 {
@@ -152,22 +178,20 @@ When finished, return valid JSON only:
   ]
 }
 
-The summary must be a string. Hypotheses must be an array of strings.
+The summary must be a string.
+Hypotheses must be an array of strings.
 Do not include Markdown code fences around the JSON.`
 
 	messages := []llm.Message{
-		{
-			Role:    "system",
-			Content: systemPrompt,
-		},
+		{Role: "system", Content: systemPrompt},
 		{
 			Role:    "user",
 			Content: "Investigate this incident: " + incident,
 		},
 	}
 
-	// 工具预算限制的是实际发起的工具执行次数。
-	// 预算耗尽后允许模型继续生成最终诊断，但不执行额外工具。
+	// 每轮最多执行一个工具调用。
+	// 额外轮次用于完成调查后的最终诊断。
 	maxRounds := maxCalls + 4
 
 	for round := 1; round <= maxRounds; round++ {
@@ -182,30 +206,88 @@ Do not include Markdown code fences around the JSON.`
 		}
 
 		remaining := maxCalls - toolCallsUsed
-		availableTools := definitions
 
-		if remaining <= 0 {
-			availableTools = nil
-			messages = append(messages, llm.Message{
-				Role: "user",
-				Content: "The tool-call budget is exhausted. " +
-					"Do not call any tools. " +
-					"Return the final diagnosis as valid JSON with " +
-					"summary and hypotheses, based only on evidence " +
-					"already collected.",
+		var plan InvestigationPlan
+		var availableTools []llm.ToolDefinition
+
+		// 仅在调查预算尚有剩余时调用规划器。
+		if remaining > 0 && !forceFinal {
+			candidates := make([]ToolCandidate, 0)
+
+			for _, registered := range r.tools.List() {
+				candidates = append(candidates, ToolCandidate{
+					Name:        registered.Name(),
+					Description: registered.Description(),
+				})
+			}
+
+			plan, err = r.planner.Plan(PlanningInput{
+				Incident:      incident,
+				Evidence:      evidenceStore.List(),
+				Hypotheses:    diagnosisManager.List(),
+				Tools:         candidates,
+				ToolCallCount: toolCallCount,
 			})
-		} else {
+
+			if err != nil {
+				if errors.Is(err, ErrNoUsefulAction) {
+					forceFinal = true
+				} else {
+					return fail(fmt.Errorf("plan investigation: %w", err))
+				}
+			} else {
+				availableTools = filterToolDefinitions(
+					definitions,
+					plan.ToolName,
+				)
+
+				if len(availableTools) == 0 {
+					return fail(fmt.Errorf(
+						"planner selected unknown tool %q",
+						plan.ToolName,
+					))
+				}
+
+				report.Plans = append(report.Plans, plan)
+
+				planJSON, err := json.Marshal(plan)
+				if err != nil {
+					return fail(fmt.Errorf(
+						"marshal investigation plan: %w",
+						err,
+					))
+				}
+
+				messages = append(messages, llm.Message{
+					Role: "system",
+					Content: fmt.Sprintf(
+						"Investigation plan for round %d:\n%s\n"+
+							"Only call the selected tool in this round. "+
+							"Make at most one tool call. "+
+							"If sufficient evidence already exists, "+
+							"return the final JSON diagnosis instead.",
+						round,
+						string(planJSON),
+					),
+				})
+			}
+		}
+
+		// 预算耗尽后不再向模型提供工具定义。
+		if remaining <= 0 {
+			forceFinal = true
+		}
+
+		if forceFinal && !finalPromptAdded {
 			messages = append(messages, llm.Message{
 				Role: "system",
-				Content: fmt.Sprintf(
-					"You have %d tool calls remaining. "+
-						"Do not request more than %d calls. "+
-						"If you have sufficient evidence, return "+
-						"the final JSON diagnosis without calling tools.",
-					remaining,
-					remaining,
-				),
+				Content: "Investigation is now closed. Do not call tools. " +
+					"Do not request additional observations. " +
+					"Return the final JSON diagnosis using only the " +
+					"evidence already collected. Explicitly state " +
+					"important uncertainties and unverified causes.",
 			})
+			finalPromptAdded = true
 		}
 
 		completion, err := r.client.Complete(
@@ -217,20 +299,23 @@ Do not include Markdown code fences around the JSON.`
 			return fail(fmt.Errorf("call LLM: %w", err))
 		}
 		if completion == nil {
-			return fail(fmt.Errorf("LLM returned a nil completion"))
+			return fail(errors.New("LLM returned a nil completion"))
 		}
 
 		assistantMessage := completion.Message
-
 		if assistantMessage.Role == "" {
 			assistantMessage.Role = "assistant"
 		}
 
-		// 模型返回最终文本。
 		if len(assistantMessage.ToolCalls) == 0 {
-			if err := applyFinalAnswer(report, assistantMessage.Content); err != nil {
+			if err := applyFinalAnswer(
+				report,
+				assistantMessage.Content,
+			); err != nil {
 				return fail(err)
 			}
+
+			report.DiagnosisHypotheses = diagnosisManager.List()
 
 			if err := transition(StateCompleted); err != nil {
 				return fail(err)
@@ -241,29 +326,68 @@ Do not include Markdown code fences around the JSON.`
 		}
 
 		calls := assistantMessage.ToolCalls
+
+		// 工具调用消息必须紧接着收到每个 call 对应的工具响应。
 		messages = append(messages, assistantMessage)
 
-		// 预算耗尽后拒绝模型提出的所有工具调用。
-		if remaining <= 0 {
+		// 最终诊断阶段禁止执行工具。
+		if forceFinal || remaining <= 0 || plan.ToolName == "" {
 			for _, call := range calls {
 				messages = append(messages, llm.Message{
 					Role:       "tool",
 					ToolCallID: call.ID,
-					Content: "Tool call rejected: budget exhausted. " +
+					Content: "Tool call not executed: investigation is closed. " +
 						"Return the final diagnosis using existing evidence.",
+				})
+			}
+
+			forceFinal = true
+			continue
+		}
+
+		// 强制执行调查计划：任何一个调用不符合计划时，
+		// 本轮所有调用都不执行，并为每个调用补齐协议响应。
+		validCalls := true
+		for _, call := range calls {
+			if call.Function.Name != plan.ToolName {
+				validCalls = false
+				break
+			}
+		}
+
+		if !validCalls {
+			for _, call := range calls {
+				messages = append(messages, llm.Message{
+					Role:       "tool",
+					ToolCallID: call.ID,
+					Content: fmt.Sprintf(
+						"Tool call not executed: this round permits only %q. "+
+							"Follow the plan or return the final diagnosis.",
+						plan.ToolName,
+					),
 				})
 			}
 			continue
 		}
 
-		allowedCount := len(calls)
+		// 一个调查轮次最多执行一个调用。
+		allowedCount := 1
 		if allowedCount > remaining {
 			allowedCount = remaining
+		}
+		if allowedCount <= 0 {
+			forceFinal = true
+			continue
 		}
 
 		if err := transition(StateExecuting); err != nil {
 			return fail(err)
 		}
+
+		// 即使工具执行失败，也计入调用预算。
+		toolCallsUsed += allowedCount
+		report.ToolCalls = toolCallsUsed
+		toolCallCount[plan.ToolName]++
 
 		execution, err := ExecuteToolCalls(
 			ctx,
@@ -273,51 +397,128 @@ Do not include Markdown code fences around the JSON.`
 		if err != nil {
 			return fail(fmt.Errorf("execute tool calls: %w", err))
 		}
+		if execution == nil {
+			return fail(errors.New("tool executor returned nil result"))
+		}
 
-		// 统计已发起的调用，包括单次工具执行失败的情况。
-		toolCallsUsed += allowedCount
-		report.ToolCalls = toolCallsUsed
-
-		// 为成功采集的证据分配全局唯一 ID。
-		for _, item := range execution.Evidence {
-			item.ID = fmt.Sprintf("ev-%03d", len(report.Evidence)+1)
-			report.Evidence = append(report.Evidence, item)
+		// 以 tool_call_id 建立映射，避免依赖结果切片顺序。
+		resultByCallID := make(map[string]llm.Message, len(execution.Messages))
+		for _, message := range execution.Messages {
+			if message.ToolCallID != "" {
+				resultByCallID[message.ToolCallID] = message
+			}
 		}
 
 		toolMessages := make([]llm.Message, 0, len(calls))
-		toolMessages = append(toolMessages, execution.Messages...)
 
-		// 对超出预算的调用补充拒绝结果，保持消息结构完整。
-		for i := allowedCount; i < len(calls); i++ {
-			toolMessages = append(toolMessages, llm.Message{
-				Role:       "tool",
-				ToolCallID: calls[i].ID,
-				Content: "Tool call rejected: the remaining tool-call " +
-					"budget has been exhausted. Use existing evidence " +
-					"to produce the final diagnosis.",
-			})
+		for i, call := range calls {
+			if i >= allowedCount {
+				// 这些调用没有执行，只添加满足 API 协议所需的响应。
+				toolMessages = append(toolMessages, llm.Message{
+					Role:       "tool",
+					ToolCallID: call.ID,
+					Content: "Tool call not executed: only one tool call is " +
+						"permitted per investigation round. Use the actual " +
+						"tool results and continue according to the plan.",
+				})
+				continue
+			}
+
+			resultMessage, ok := resultByCallID[call.ID]
+			if !ok {
+				toolMessages = append(toolMessages, llm.Message{
+					Role:       "tool",
+					ToolCallID: call.ID,
+					Content: "Tool execution returned no response for this call. " +
+						"Treat the observation as unavailable and continue " +
+						"only with verified evidence.",
+				})
+				continue
+			}
+
+			resultMessage.Role = "tool"
+			resultMessage.ToolCallID = call.ID
+			toolMessages = append(toolMessages, resultMessage)
 		}
 
-		// 工具结果按调用顺序返回给模型。
-		for i, call := range calls {
+		// 所有工具响应必须紧跟在 assistant 工具调用消息之后。
+		messages = append(messages, toolMessages...)
+
+		// 只打印真正执行的调用，并通过 ID 获取其真实结果。
+		for i := 0; i < allowedCount; i++ {
+			call := calls[i]
+
 			fmt.Printf(
 				"[TraceMind] tool=%s arguments=%s\n",
 				call.Function.Name,
 				call.Function.Arguments,
 			)
 
-			if i < len(toolMessages) {
+			resultMessage, ok := resultByCallID[call.ID]
+			if ok {
 				fmt.Printf(
 					"[TraceMind] result=%s\n",
-					toolMessages[i].Content,
+					resultMessage.Content,
+				)
+			} else {
+				fmt.Printf(
+					"[TraceMind] result=%s\n",
+					"Tool execution returned no response for this call.",
 				)
 			}
 		}
 
-		messages = append(messages, toolMessages...)
+		// 保存证据，并在本次事件范围内生成唯一 ID。
+		for _, item := range execution.Evidence {
+			item.ID = fmt.Sprintf("ev-%03d", len(report.Evidence)+1)
+			if item.CreatedAt.IsZero() {
+				item.CreatedAt = time.Now().UTC()
+			}
+
+			if err := evidenceStore.Add(item); err != nil {
+				return fail(fmt.Errorf("store evidence: %w", err))
+			}
+			report.Evidence = append(report.Evidence, item)
+		}
+
+		// 工具调用轮次结束后，再统一评估假设。
+		if len(execution.Evidence) > 0 {
+			if err := evaluateHypotheses(
+				ctx,
+				r.client,
+				incident,
+				evidenceStore,
+				diagnosisManager,
+			); err != nil {
+				return fail(fmt.Errorf("evaluate hypotheses: %w", err))
+			}
+
+			report.DiagnosisHypotheses = diagnosisManager.List()
+
+			hypothesisJSON, err := json.Marshal(
+				report.DiagnosisHypotheses,
+			)
+			if err != nil {
+				return fail(fmt.Errorf("marshal hypotheses: %w", err))
+			}
+
+			messages = append(messages, llm.Message{
+				Role: "system",
+				Content: "Updated structured hypothesis assessment:\n" +
+					string(hypothesisJSON) +
+					"\nUse this assessment together with actual tool results. " +
+					"A supported hypothesis is not automatically a " +
+					"confirmed root cause.",
+			})
+		}
 
 		if err := transition(StateObserving); err != nil {
 			return fail(err)
+		}
+
+		// 预算耗尽后，下一轮只请求最终诊断。
+		if toolCallsUsed >= maxCalls {
+			forceFinal = true
 		}
 	}
 
@@ -327,16 +528,47 @@ Do not include Markdown code fences around the JSON.`
 	))
 }
 
-// applyFinalAnswer 严格解析模型返回的最终诊断。
-// 无效 JSON 或缺少有效摘要时返回错误，避免异常输出被当作正常诊断。
+func filterToolDefinitions(
+	definitions []llm.ToolDefinition,
+	allowedName string,
+) []llm.ToolDefinition {
+	result := make([]llm.ToolDefinition, 0, 1)
+
+	for _, definition := range definitions {
+		data, err := json.Marshal(definition)
+		if err != nil {
+			continue
+		}
+
+		var object map[string]any
+		if err := json.Unmarshal(data, &object); err != nil {
+			continue
+		}
+
+		name := ""
+		if function, ok := object["function"].(map[string]any); ok {
+			name, _ = function["name"].(string)
+		}
+		if name == "" {
+			name, _ = object["name"].(string)
+		}
+
+		if name == allowedName {
+			result = append(result, definition)
+		}
+	}
+
+	return result
+}
+
 func applyFinalAnswer(report *Report, content string) error {
 	if report == nil {
-		return fmt.Errorf("report cannot be nil")
+		return errors.New("report cannot be nil")
 	}
 
 	content = strings.TrimSpace(content)
 	if content == "" {
-		return fmt.Errorf("LLM returned an empty final answer")
+		return errors.New("LLM returned an empty final answer")
 	}
 
 	var result struct {
@@ -350,7 +582,7 @@ func applyFinalAnswer(report *Report, content string) error {
 
 	result.Summary = strings.TrimSpace(result.Summary)
 	if result.Summary == "" {
-		return fmt.Errorf("final diagnosis summary cannot be empty")
+		return errors.New("final diagnosis summary cannot be empty")
 	}
 
 	if result.Hypotheses == nil {
@@ -369,6 +601,5 @@ func applyFinalAnswer(report *Report, content string) error {
 
 	report.Summary = result.Summary
 	report.Hypotheses = result.Hypotheses
-
 	return nil
 }
