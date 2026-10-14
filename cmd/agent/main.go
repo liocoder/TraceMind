@@ -4,64 +4,114 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"log"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/liocoder/TraceMind/internal/agent"
+	"github.com/liocoder/TraceMind/internal/config"
+	"github.com/liocoder/TraceMind/internal/llm"
 	"github.com/liocoder/TraceMind/internal/tool"
 )
 
 func main() {
-	fmt.Println("TraceMind - Incident Diagnosis Agent")
-	fmt.Print("Describe the incident: ")
+	configPath := flag.String(
+		"config",
+		"config.yaml",
+		"Path to the configuration file",
+	)
+	incidentFlag := flag.String(
+		"incident",
+		"",
+		"Incident description to investigate",
+	)
+	flag.Parse()
 
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		if err := scanner.Err(); err != nil {
-			fmt.Fprintf(os.Stderr, "read incident: %v\n", err)
+	incident := strings.TrimSpace(*incidentFlag)
+	if incident == "" {
+		fmt.Println("Enter the incident description:")
+		fmt.Println("Example: The order service frequently times out and returns HTTP 502.")
+		fmt.Print("> ")
+
+		reader := bufio.NewReader(os.Stdin)
+		input, err := reader.ReadString('\n')
+		if err != nil && len(input) == 0 {
+			log.Fatalf("read incident description: %v", err)
 		}
-		os.Exit(1)
+		incident = strings.TrimSpace(input)
 	}
 
-	incident := strings.TrimSpace(scanner.Text())
 	if incident == "" {
-		fmt.Fprintln(os.Stderr, "incident description cannot be empty")
-		os.Exit(1)
+		log.Fatal("incident description cannot be empty")
+	}
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		log.Fatalf("load config: %v", err)
+	}
+
+	client, err := llm.NewClient(cfg.LLM)
+	if err != nil {
+		log.Fatalf("initialize LLM client: %v", err)
 	}
 
 	registry := tool.NewRegistry()
 
 	if err := registry.Register(&tool.MockLogSearch{}); err != nil {
-		fmt.Fprintf(os.Stderr, "register log tool: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("register log tool: %v", err)
 	}
 
 	if err := registry.Register(&tool.MockMetricsQuery{}); err != nil {
-		fmt.Fprintf(os.Stderr, "register metrics tool: %v\n", err)
-		os.Exit(1)
+		log.Fatalf("register metrics tool: %v", err)
 	}
 
-	runtime := agent.NewRuntime(registry)
+	runtime := agent.NewRuntime(registry, client)
+
+	if cfg.Agent.MaxToolCalls > 0 {
+		runtime.SetMaxToolCalls(cfg.Agent.MaxToolCalls)
+	}
+
+	timeoutSeconds := cfg.Agent.TimeoutSeconds
+	if timeoutSeconds <= 0 {
+		timeoutSeconds = 60
+	}
+
+	ctx, stop := signal.NotifyContext(
+		context.Background(),
+		os.Interrupt,
+		syscall.SIGTERM,
+	)
+	defer stop()
 
 	ctx, cancel := context.WithTimeout(
-		context.Background(),
-		10*time.Second,
+		ctx,
+		time.Duration(timeoutSeconds)*time.Second,
 	)
 	defer cancel()
 
 	report, err := runtime.Run(ctx, incident)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "diagnosis failed: %v\n", err)
-		os.Exit(1)
+		if report != nil {
+			fmt.Fprintln(os.Stderr, "Partial report:")
+			if encodeErr := printJSON(os.Stderr, report); encodeErr != nil {
+				log.Printf("encode partial report: %v", encodeErr)
+			}
+		}
+		log.Fatalf("incident diagnosis failed: %v", err)
 	}
 
-	encoder := json.NewEncoder(os.Stdout)
+	if err := printJSON(os.Stdout, report); err != nil {
+		log.Fatalf("encode report: %v", err)
+	}
+}
+
+func printJSON(out *os.File, value any) error {
+	encoder := json.NewEncoder(out)
 	encoder.SetIndent("", "  ")
-
-	if err := encoder.Encode(report); err != nil {
-		fmt.Fprintf(os.Stderr, "encode report: %v\n", err)
-		os.Exit(1)
-	}
+	return encoder.Encode(value)
 }
