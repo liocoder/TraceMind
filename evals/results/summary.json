@@ -1,0 +1,102 @@
+﻿[
+    {
+        "scenario":  "connection_pool_exhaustion",
+        "score":  100,
+        "expected_hit":  true,
+        "matched_terms":  "connection pool; pool exhaustion; pool exhausted",
+        "forbidden_hits":  "none",
+        "tool_calls":  2,
+        "state":  "completed",
+        "error":  ""
+    },
+    {
+        "scenario":  "cpu_spike",
+        "score":  100,
+        "expected_hit":  true,
+        "matched_terms":  "CPU; cpu",
+        "forbidden_hits":  "none",
+        "tool_calls":  2,
+        "state":  "completed",
+        "error":  ""
+    },
+    {
+        "scenario":  "downstream_timeout",
+        "score":  100,
+        "expected_hit":  true,
+        "matched_terms":  "payment-service; downstream; dependency",
+        "forbidden_hits":  "none",
+        "tool_calls":  3,
+        "state":  "completed",
+        "error":  ""
+    },
+    {
+        "scenario":  "database_slow_query",
+        "score":  100,
+        "expected_hit":  true,
+        "matched_terms":  "database",
+        "forbidden_hits":  "none",
+        "tool_calls":  2,
+        "state":  "completed",
+        "error":  ""
+    },
+    {
+        "scenario":  "redis_latency",
+        "score":  100,
+        "expected_hit":  true,
+        "matched_terms":  "redis; cache",
+        "forbidden_hits":  "none",
+        "tool_calls":  2,
+        "state":  "completed",
+        "error":  ""
+    },
+    {
+        "scenario":  "traffic_spike",
+        "score":  100,
+        "expected_hit":  true,
+        "matched_terms":  "traffic; request rate",
+        "forbidden_hits":  "none",
+        "tool_calls":  2,
+        "state":  "completed",
+        "error":  ""
+    },
+    {
+        "scenario":  "high_errors_normal_resources",
+        "score":  100,
+        "expected_hit":  true,
+        "matched_terms":  "validation; business; invalid order",
+        "forbidden_hits":  "none",
+        "tool_calls":  2,
+        "state":  "completed",
+        "error":  ""
+    },
+    {
+        "scenario":  "conflicting_signals",
+        "score":  100,
+        "expected_hit":  true,
+        "matched_terms":  "discrepancy; single application instance; not confirmed; not yet investigated",
+        "forbidden_hits":  "none",
+        "tool_calls":  2,
+        "state":  "completed",
+        "error":  ""
+    },
+    {
+        "scenario":  "insufficient_evidence",
+        "score":  100,
+        "expected_hit":  true,
+        "matched_terms":  "insufficient",
+        "forbidden_hits":  "none",
+        "tool_calls":  2,
+        "state":  "completed",
+        "error":  ""
+    },
+    {
+        "scenario":  "multiple_anomalies",
+        "score":  100,
+        "expected_hit":  true,
+        "matched_terms":  "connection pool; CPU",
+        "forbidden_hits":  "none",
+        "tool_calls":  2,
+        "state":  "completed",
+        "error":  ""
+    }
+]
