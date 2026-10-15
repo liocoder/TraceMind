@@ -124,7 +124,7 @@ Evidence discipline:
 16. Return an empty hypotheses array if no defensible hypothesis can be formed.
 17. Do not use Markdown code fences.
 
-Input data:
+Input runbooks:
 ` + string(payload)
 
 	completion, err := client.Complete(
@@ -156,7 +156,6 @@ Input data:
 		existingByTitle[normalizeHypothesisTitle(h.Title)] = h
 	}
 
-	// Build an allowlist from the actual evidence returned by the store.
 	validEvidenceIDs := make(map[string]struct{}, len(items))
 	for _, item := range items {
 		validEvidenceIDs[item.ID] = struct{}{}
@@ -170,6 +169,7 @@ Input data:
 		if item.Title == "" || item.Description == "" {
 			continue
 		}
+
 		if math.IsNaN(item.Confidence) ||
 			math.IsInf(item.Confidence, 0) ||
 			item.Confidence < 0 ||
@@ -177,26 +177,24 @@ Input data:
 			continue
 		}
 
-		// Prefer title matching to keep an existing hypothesis identity stable.
+		// Prefer title matching to preserve an existing hypothesis identity.
 		old, hasOld := existingByTitle[normalizeHypothesisTitle(item.Title)]
 		if hasOld {
 			item.ID = old.ID
 		} else {
-			// Never overwrite an unrelated hypothesis because the model
-			// accidentally reused its ID.
+			// Do not overwrite an unrelated hypothesis if the model reuses its ID.
 			if other, exists := existingByID[item.ID]; exists &&
 				normalizeHypothesisTitle(other.Title) != normalizeHypothesisTitle(item.Title) {
 				item.ID = stableHypothesisID(item.Title)
 			}
 
-			// Accept only the documented format for new model-generated IDs.
 			if !isHypothesisID(item.ID) {
 				item.ID = stableHypothesisID(item.Title)
 			}
 
 			if other, exists := existingByID[item.ID]; exists &&
 				normalizeHypothesisTitle(other.Title) != normalizeHypothesisTitle(item.Title) {
-				// Extremely unlikely hash collision: do not overwrite either hypothesis.
+				// Avoid overwriting an unrelated hypothesis on a hash collision.
 				continue
 			}
 		}
@@ -236,10 +234,10 @@ Input data:
 			}
 
 			seenResponseLinks[link.EvidenceID] = struct{}{}
-			// Update the relationship and rationale for existing evidence too.
 			linksByID[link.EvidenceID] = link
 		}
 
+		// Keep evidence links in the store's deterministic order.
 		mergedLinks := make([]diagnosis.EvidenceLink, 0, len(linksByID))
 		for _, evidenceItem := range items {
 			if link, ok := linksByID[evidenceItem.ID]; ok {
@@ -256,10 +254,18 @@ Input data:
 			Evidence:    mergedLinks,
 		}
 
-		if err := candidate.Validate(); err != nil {
+		if len(candidate.Evidence) == 0 {
 			continue
 		}
-		if len(candidate.Evidence) == 0 {
+
+		// Apply deterministic constraints before structural validation.
+		candidate.Status, candidate.Confidence = constrainHypothesisAssessment(
+			candidate.Status,
+			candidate.Confidence,
+			candidate.Evidence,
+		)
+
+		if err := candidate.Validate(); err != nil {
 			continue
 		}
 
@@ -274,7 +280,6 @@ Input data:
 
 		if err := manager.Add(candidate); err != nil {
 			if errors.Is(err, diagnosis.ErrHypothesisExists) {
-				// Avoid clobbering a concurrent or unrelated hypothesis.
 				continue
 			}
 			return fmt.Errorf("add hypothesis %q: %w", candidate.ID, err)
@@ -282,6 +287,52 @@ Input data:
 	}
 
 	return nil
+}
+
+// constrainHypothesisAssessment ensures the assessment is consistent with
+// the evidence relationships attached to a hypothesis.
+//
+// It validates the declared relationships, not the semantic correctness of
+// the model's interpretation of the underlying evidence.
+func constrainHypothesisAssessment(
+	status diagnosis.Status,
+	confidence float64,
+	links []diagnosis.EvidenceLink,
+) (diagnosis.Status, float64) {
+	hasSupports := false
+	hasRefutes := false
+
+	for _, link := range links {
+		switch link.Relation {
+		case diagnosis.RelationSupports:
+			hasSupports = true
+		case diagnosis.RelationRefutes:
+			hasRefutes = true
+		}
+	}
+
+	// Evidence pointing in both directions requires an inconclusive assessment.
+	if hasSupports && hasRefutes {
+		return diagnosis.StatusInconclusive, math.Min(confidence, 0.5)
+	}
+
+	// Supporting evidence is required for a supported assessment.
+	if status == diagnosis.StatusSupported && !hasSupports {
+		if hasRefutes {
+			return diagnosis.StatusInconclusive, math.Min(confidence, 0.4)
+		}
+		return diagnosis.StatusProposed, math.Min(confidence, 0.4)
+	}
+
+	// Refuting evidence is required for a refuted assessment.
+	if status == diagnosis.StatusRefuted && !hasRefutes {
+		if hasSupports {
+			return diagnosis.StatusInconclusive, math.Min(confidence, 0.4)
+		}
+		return diagnosis.StatusProposed, math.Min(confidence, 0.4)
+	}
+
+	return status, confidence
 }
 
 func normalizeHypothesisTitle(title string) string {
@@ -297,10 +348,12 @@ func isHypothesisID(id string) bool {
 	if len(id) != len("hyp-")+8 || !strings.HasPrefix(id, "hyp-") {
 		return false
 	}
+
 	for _, ch := range id[4:] {
 		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') {
 			return false
 		}
 	}
+
 	return true
 }

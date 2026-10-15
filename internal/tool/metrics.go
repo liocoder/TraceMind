@@ -3,47 +3,40 @@ package tool
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
+	"time"
+
+	"github.com/liocoder/TraceMind/internal/datasource"
 )
 
-type MockMetricsQuery struct{}
+type MetricsQueryTool struct {
+	Provider datasource.MetricsProvider
+}
 
-func (m *MockMetricsQuery) Name() string {
+func NewMetricsQueryTool(
+	provider datasource.MetricsProvider,
+) *MetricsQueryTool {
+	return &MetricsQueryTool{Provider: provider}
+}
+
+func (t *MetricsQueryTool) Name() string {
 	return "query_metrics"
 }
 
-func (m *MockMetricsQuery) Description() string {
-	return "Query simulated service health metrics, including latency, error rate, connection pool usage, and CPU utilization. Supported services: order-service, payment-service, database, api-gateway."
+func (t *MetricsQueryTool) Description() string {
+	return "Query service health metrics. Provide a service name to inspect its observed metrics."
 }
 
-// normalizeServiceName 将常见中文名称和别名转换为标准服务名。
-func normalizeServiceName(service string) string {
-	service = strings.ToLower(strings.TrimSpace(service))
-
-	switch service {
-	case "订单服务", "订单", "order", "order_service":
-		return "order-service"
-
-	case "支付服务", "支付", "payment", "payment_service":
-		return "payment-service"
-
-	case "数据库", "订单数据库", "mysql", "order-db", "order_db":
-		return "database"
-
-	case "网关", "api网关", "gateway", "api_gateway":
-		return "api-gateway"
-
-	default:
-		return service
-	}
-}
-
-func (m *MockMetricsQuery) Execute(
+func (t *MetricsQueryTool) Execute(
 	ctx context.Context,
 	input map[string]any,
 ) (Result, error) {
 	if err := ctx.Err(); err != nil {
 		return Result{}, err
+	}
+	if t == nil || t.Provider == nil {
+		return Result{}, fmt.Errorf("metrics provider is not configured")
 	}
 
 	service, ok := input["service"].(string)
@@ -51,41 +44,80 @@ func (m *MockMetricsQuery) Execute(
 		return Result{}, fmt.Errorf("service must be a non-empty string")
 	}
 
-	service = normalizeServiceName(service)
+	service = datasource.NormalizeServiceName(service)
 
-	var content string
-
-	switch service {
-	case "order-service":
-		content = "service=order-service, p95_latency_ms=1850, error_rate=8.5%, connection_pool_usage=98%, cpu_usage=42%, status=degraded"
-
-	case "payment-service":
-		content = "service=payment-service, p95_latency_ms=3200, error_rate=12.6%, connection_pool_usage=76%, cpu_usage=38%, status=degraded"
-
-	case "database":
-		content = "service=database, p95_latency_ms=35, error_rate=0.1%, connection_pool_usage=45%, cpu_usage=51%, status=healthy"
-
-	case "api-gateway":
-		content = "service=api-gateway, p95_latency_ms=2100, error_rate=7.9%, upstream_timeout_count=126, status=degraded"
-
-	default:
-		return Result{
-			Content: fmt.Sprintf(
-				"service=%s, status=unknown, error=no simulated metrics available for this service",
-				service,
-			),
-			Metadata: map[string]string{
-				"source":  "mock-metrics-store",
-				"service": service,
-			},
-		}, nil
+	snapshots, err := t.Provider.QueryMetrics(ctx, datasource.MetricsQuery{
+		Service: service,
+	})
+	if err != nil {
+		return Result{}, fmt.Errorf("query metrics for %q: %w", service, err)
 	}
 
 	return Result{
-		Content: content,
+		Content: formatMetrics(snapshots),
 		Metadata: map[string]string{
-			"source":  "mock-metrics-store",
+			"source":  "metrics-provider",
 			"service": service,
+			"count":   fmt.Sprintf("%d", len(snapshots)),
 		},
 	}, nil
+}
+
+func formatMetrics(snapshots []datasource.MetricsSnapshot) string {
+	if len(snapshots) == 0 {
+		return "No metrics available for the requested service and time range."
+	}
+
+	var builder strings.Builder
+
+	for i, snapshot := range snapshots {
+		if i > 0 {
+			builder.WriteString("\n")
+		}
+
+		fmt.Fprintf(&builder, "service=%s", snapshot.Service)
+
+		if !snapshot.Timestamp.IsZero() {
+			fmt.Fprintf(
+				&builder,
+				", timestamp=%s",
+				snapshot.Timestamp.UTC().Format(time.RFC3339),
+			)
+		}
+		if snapshot.Status != "" {
+			fmt.Fprintf(&builder, ", status=%s", snapshot.Status)
+		}
+
+		names := make([]string, 0, len(snapshot.Values))
+		for name := range snapshot.Values {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+
+		for _, name := range names {
+			value := snapshot.Values[name]
+			fmt.Fprintf(
+				&builder,
+				", %s=%s",
+				name,
+				formatMetricValue(value),
+			)
+		}
+	}
+
+	return builder.String()
+}
+
+func formatMetricValue(value datasource.MetricValue) string {
+	return fmt.Sprintf("%s%s", formatNumber(value.Value), value.Unit)
+}
+
+func formatNumber(value float64) string {
+	formatted := fmt.Sprintf("%.6f", value)
+	formatted = strings.TrimRight(formatted, "0")
+	formatted = strings.TrimRight(formatted, ".")
+	if formatted == "" || formatted == "-0" {
+		return "0"
+	}
+	return formatted
 }

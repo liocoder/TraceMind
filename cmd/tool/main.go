@@ -2,16 +2,30 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"log"
 	"time"
 
 	"github.com/liocoder/TraceMind/internal/config"
+	"github.com/liocoder/TraceMind/internal/datasource/mock"
 	"github.com/liocoder/TraceMind/internal/llm"
 	"github.com/liocoder/TraceMind/internal/tool"
 )
 
 func main() {
+	datasetPath := flag.String(
+		"dataset",
+		"evals/datasets/observations.json",
+		"Path to the mock observation dataset",
+	)
+	scenarioID := flag.String(
+		"scenario",
+		"default",
+		"Scenario ID in the mock observation dataset",
+	)
+	flag.Parse()
+
 	cfg, err := config.Load("config.yaml")
 	if err != nil {
 		log.Fatal(err)
@@ -22,13 +36,18 @@ func main() {
 		log.Fatal(err)
 	}
 
+	provider, err := mock.NewProvider(*datasetPath, *scenarioID)
+	if err != nil {
+		log.Fatalf("initialize mock runbooks provider: %v", err)
+	}
+
 	registry := tool.NewRegistry()
 
-	if err := registry.Register(&tool.MockLogSearch{}); err != nil {
-		log.Fatal(err)
+	if err := registry.Register(tool.NewLogsSearchTool(provider)); err != nil {
+		log.Fatalf("register log search tool: %v", err)
 	}
-	if err := registry.Register(&tool.MockMetricsQuery{}); err != nil {
-		log.Fatal(err)
+	if err := registry.Register(tool.NewMetricsQueryTool(provider)); err != nil {
+		log.Fatalf("register metrics query tool: %v", err)
 	}
 
 	definitions, err := registry.ToLLMDefinitions()

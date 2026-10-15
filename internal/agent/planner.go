@@ -1,11 +1,16 @@
 package agent
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/liocoder/TraceMind/internal/diagnosis"
 	"github.com/liocoder/TraceMind/internal/evidence"
+	"github.com/liocoder/TraceMind/internal/llm"
+	"github.com/liocoder/TraceMind/internal/rag"
 )
 
 var (
@@ -14,8 +19,8 @@ var (
 )
 
 type ToolCandidate struct {
-	Name        string
-	Description string
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
 type PlanningInput struct {
@@ -24,6 +29,7 @@ type PlanningInput struct {
 	Hypotheses    []diagnosis.Hypothesis
 	Tools         []ToolCandidate
 	ToolCallCount map[string]int
+	Knowledge     []rag.Document
 }
 
 type InvestigationPlan struct {
@@ -37,121 +43,322 @@ type Planner interface {
 	Plan(input PlanningInput) (InvestigationPlan, error)
 }
 
-type RulePlanner struct{}
-
-func NewPlanner() *RulePlanner {
-	return &RulePlanner{}
+type plannerClient interface {
+	Complete(
+		ctx context.Context,
+		messages []llm.Message,
+		tools []llm.ToolDefinition,
+	) (*llm.Completion, error)
 }
 
-func (p *RulePlanner) Plan(input PlanningInput) (InvestigationPlan, error) {
-	if len(input.Tools) == 0 {
+// LLMPlanner 通过模型推理选择下一步调查工具。
+// 模型只负责提出计划，实际工具执行由 Runtime 控制。
+type LLMPlanner struct {
+	client plannerClient
+}
+
+// NewPlanner 创建 LLM Planner。
+// 不传 Client 时，只有在实际调用 Plan 时才会返回 Client 未配置错误。
+func NewPlanner(clients ...plannerClient) *LLMPlanner {
+	var client plannerClient
+	if len(clients) > 0 {
+		client = clients[0]
+	}
+	return &LLMPlanner{client: client}
+}
+
+func NewLLMPlanner(client plannerClient) *LLMPlanner {
+	return NewPlanner(client)
+}
+
+// Plan 保留原有 Planner 接口，兼容尚未改成 PlanContext 的调用方。
+func (p *LLMPlanner) Plan(input PlanningInput) (InvestigationPlan, error) {
+	return p.PlanContext(context.Background(), input)
+}
+
+// PlanContext 允许 Runtime 传入 context，支持请求取消与超时控制。
+func (p *LLMPlanner) PlanContext(
+	ctx context.Context,
+	input PlanningInput,
+) (InvestigationPlan, error) {
+	if strings.TrimSpace(input.Incident) == "" {
+		return InvestigationPlan{}, errors.New("incident description cannot be empty")
+	}
+
+	available := make(map[string]ToolCandidate, len(input.Tools))
+	for _, candidate := range input.Tools {
+		candidate.Name = strings.TrimSpace(candidate.Name)
+		if candidate.Name == "" {
+			continue
+		}
+		available[candidate.Name] = candidate
+	}
+
+	if len(available) == 0 {
 		return InvestigationPlan{}, ErrNoAvailableTools
 	}
 
-	toolByName := make(map[string]ToolCandidate, len(input.Tools))
+	if p == nil || p.client == nil {
+		return InvestigationPlan{}, errors.New("LLM planner client is not configured")
+	}
+
+	// 只向模型传入去重后的工具列表，避免同名工具产生歧义。
+	tools := make([]ToolCandidate, 0, len(available))
 	for _, candidate := range input.Tools {
-		toolByName[candidate.Name] = candidate
-	}
-
-	hasMetrics := false
-	hasLogs := false
-
-	for _, item := range input.Evidence {
-		source := strings.ToLower(item.Source)
-		content := strings.ToLower(item.Content)
-
-		if strings.Contains(source, "metrics") &&
-			!strings.Contains(content, "no simulated metrics available") &&
-			!strings.Contains(content, "status=unknown") {
-			hasMetrics = true
-		}
-
-		if strings.Contains(source, "log") {
-			hasLogs = true
-		}
-	}
-
-	incident := strings.ToLower(input.Incident)
-	hasLatencyIssue := containsAny(incident,
-		"latency", "p99", "p95", "延迟", "耗时", "变慢")
-	hasErrorIssue := containsAny(incident,
-		"502", "500", "timeout", "error", "异常", "超时", "错误")
-	hasDependencyClue := containsAny(incident,
-		"下游", "依赖", "payment", "database", "数据库", "支付")
-
-	if !hasMetrics {
-		if candidate, ok := toolByName["query_metrics"]; ok {
-			return InvestigationPlan{
-				ToolName:            candidate.Name,
-				Rationale:           "先获取服务运行指标，确认延迟、错误率和连接池使用情况。",
-				ExpectedObservation: "获得服务健康指标，判断是否存在连接池饱和、错误率升高或其他资源瓶颈。",
-			}, nil
-		}
-	}
-
-	if !hasLogs {
-		if candidate, ok := toolByName["search_logs"]; ok {
-			return InvestigationPlan{
-				ToolName:            candidate.Name,
-				Rationale:           "通过错误日志定位超时和异常发生的具体环节。",
-				ExpectedObservation: "确认是否出现请求超时、连接池耗尽或下游依赖异常等日志线索。",
-			}, nil
-		}
-	}
-
-	var targetID string
-	for _, hypothesis := range input.Hypotheses {
-		if hypothesis.Status == diagnosis.StatusRefuted {
+		name := strings.TrimSpace(candidate.Name)
+		if name == "" {
 			continue
 		}
-		if hypothesis.ID != "" {
-			targetID = hypothesis.ID
-			break
+		if _, ok := available[name]; !ok {
+			continue
 		}
+		tools = append(tools, available[name])
+		delete(available, name)
 	}
 
-	if hasDependencyClue || evidenceMentionsDependency(input.Evidence) {
-		if candidate, ok := toolByName["query_metrics"]; ok &&
-			input.ToolCallCount[candidate.Name] < 2 {
-			return InvestigationPlan{
-				ToolName:            candidate.Name,
-				Rationale:           "现有证据提示可能存在下游依赖问题，需要进一步核对相关服务的健康状态。",
-				TargetHypothesisID:  targetID,
-				ExpectedObservation: "检查相关依赖的延迟和错误率，判断下游劣化是否可能导致订单服务连接池耗尽。",
-			}, nil
-		}
+	// 恢复可用工具映射，供模型输出校验使用。
+	available = make(map[string]ToolCandidate, len(tools))
+	for _, candidate := range tools {
+		available[candidate.Name] = candidate
 	}
 
-	if !hasLogs {
-		if candidate, ok := toolByName["search_logs"]; ok {
-			return InvestigationPlan{
-				ToolName:            candidate.Name,
-				Rationale:           "当前缺少日志证据，需要定位异常发生的具体环节。",
-				TargetHypothesisID:  targetID,
-				ExpectedObservation: "获取与超时、连接池或下游调用有关的错误日志。",
-			}, nil
-		}
+	payload := struct {
+		Incident      string                  `json:"incident"`
+		Evidence      []evidence.Evidence     `json:"evidence"`
+		Hypotheses    []diagnosis.Hypothesis  `json:"hypotheses"`
+		Tools         []ToolCandidate         `json:"available_tools"`
+		ToolCallCount map[string]int          `json:"tool_call_count"`
+		Knowledge     []plannerKnowledgeBrief `json:"reference_knowledge,omitempty"`
+	}{
+		Incident:      input.Incident,
+		Evidence:      input.Evidence,
+		Hypotheses:    input.Hypotheses,
+		Tools:         tools,
+		ToolCallCount: input.ToolCallCount,
 	}
 
-	for _, candidate := range input.Tools {
-		if input.ToolCallCount[candidate.Name] == 0 {
-			return InvestigationPlan{
-				ToolName:            candidate.Name,
-				Rationale:           "补充尚未执行的调查手段，验证现有诊断是否存在遗漏。",
-				TargetHypothesisID:  targetID,
-				ExpectedObservation: "获取新的独立证据，以验证或排除现有根因假设。",
-			}, nil
-		}
+	for _, doc := range input.Knowledge {
+		payload.Knowledge = append(payload.Knowledge, plannerKnowledgeBrief{
+			ID:               doc.ID,
+			Title:            doc.Title,
+			Source:           doc.Source,
+			Content:          truncateText(doc.Content, 2500),
+			RecommendedTools: doc.RecommendedTools,
+		})
 	}
 
-	if hasLatencyIssue || hasErrorIssue {
+	inputJSON, err := json.Marshal(payload)
+	if err != nil {
+		return InvestigationPlan{}, fmt.Errorf("encode planner input: %w", err)
+	}
+
+	systemPrompt := `You are the investigation planner for TraceMind, an incident diagnosis agent.
+
+Choose exactly ONE useful next investigation tool, or return NO_ACTION when further investigation is not useful.
+
+You receive the incident description, observations collected from tools, current hypotheses, available tools, tool-call counts, and optional runbook knowledge.
+
+Rules:
+1. Choose based on the incident, actual observations, and unresolved uncertainties.
+2. Do not assume a root cause merely because it is mentioned in the incident or runbook.
+3. Runbook knowledge is guidance, not evidence from the current incident.
+4. Prefer a tool that distinguishes competing hypotheses or verifies a prediction.
+5. Avoid repeating a query that has already provided sufficient information.
+6. Select only an exact tool name from available_tools.
+7. Never invent a tool, observation, hypothesis ID, or tool result.
+8. If useful investigation remains possible, continue investigating.
+9. If evidence is sufficient or no available tool can reduce uncertainty, return NO_ACTION.
+10. Return valid JSON only. Do not use Markdown fences.
+
+For a tool call, return:
+{
+"action": "CALL_TOOL",
+"tool_name": "exact available tool name",
+"rationale": "why this is the most useful next step",
+"target_hypothesis_id": "an existing hypothesis ID or empty string",
+"expected_observation": "what evidence the call should seek"
+}
+
+For no further action, return:
+{
+"action": "NO_ACTION",
+"tool_name": "",
+"rationale": "why no further tool call is useful",
+"target_hypothesis_id": "",
+"expected_observation": ""
+}`
+
+	completion, err := p.client.Complete(ctx, []llm.Message{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: string(inputJSON)},
+	}, nil)
+	if err != nil {
+		return InvestigationPlan{}, fmt.Errorf("LLM planning request: %w", err)
+	}
+	if completion == nil {
+		return InvestigationPlan{}, errors.New("LLM planner returned nil completion")
+	}
+
+	content := strings.TrimSpace(completion.Message.Content)
+	if content == "" {
+		return InvestigationPlan{}, errors.New("LLM planner returned empty content")
+	}
+
+	var result struct {
+		Action              string `json:"action"`
+		ToolName            string `json:"tool_name"`
+		Rationale           string `json:"rationale"`
+		TargetHypothesisID  string `json:"target_hypothesis_id"`
+		ExpectedObservation string `json:"expected_observation"`
+	}
+
+	if err := json.Unmarshal([]byte(content), &result); err != nil {
+		return InvestigationPlan{}, fmt.Errorf(
+			"decode LLM planning response: %w; response=%q",
+			err,
+			truncateText(content, 500),
+		)
+	}
+
+	switch strings.ToUpper(strings.TrimSpace(result.Action)) {
+	case "NO_ACTION":
 		return InvestigationPlan{}, ErrNoUsefulAction
+	case "CALL_TOOL":
+		// 继续校验工具名及计划内容。
+	default:
+		return InvestigationPlan{}, fmt.Errorf(
+			"LLM planner returned unsupported action %q",
+			result.Action,
+		)
 	}
 
-	return InvestigationPlan{}, ErrNoUsefulAction
+	result.ToolName = strings.TrimSpace(result.ToolName)
+	if _, ok := available[result.ToolName]; !ok {
+		return InvestigationPlan{}, fmt.Errorf(
+			"LLM planner selected unavailable tool %q",
+			result.ToolName,
+		)
+	}
+
+	result.Rationale = strings.TrimSpace(result.Rationale)
+	result.ExpectedObservation = strings.TrimSpace(result.ExpectedObservation)
+	result.TargetHypothesisID = strings.TrimSpace(result.TargetHypothesisID)
+
+	if result.Rationale == "" {
+		return InvestigationPlan{}, errors.New("LLM planner returned empty rationale")
+	}
+	if result.ExpectedObservation == "" {
+		return InvestigationPlan{}, errors.New("LLM planner returned empty expected_observation")
+	}
+
+	if result.TargetHypothesisID != "" {
+		found := false
+		for _, hypothesis := range input.Hypotheses {
+			if hypothesis.ID == result.TargetHypothesisID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return InvestigationPlan{}, fmt.Errorf(
+				"LLM planner referenced unknown hypothesis ID %q",
+				result.TargetHypothesisID,
+			)
+		}
+	}
+
+	return InvestigationPlan{
+		ToolName:            result.ToolName,
+		Rationale:           result.Rationale,
+		TargetHypothesisID:  result.TargetHypothesisID,
+		ExpectedObservation: result.ExpectedObservation,
+	}, nil
+}
+
+type plannerKnowledgeBrief struct {
+	ID               string   `json:"id"`
+	Title            string   `json:"title"`
+	Source           string   `json:"source"`
+	Content          string   `json:"content"`
+	RecommendedTools []string `json:"recommended_tools,omitempty"`
+}
+
+func truncateText(value string, maxRunes int) string {
+	value = strings.TrimSpace(value)
+	if maxRunes <= 0 {
+		return ""
+	}
+
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+
+	return string(runes[:maxRunes]) + "..."
+}
+
+// 以下辅助函数保留，以免项目中其他代码仍有引用。
+func selectTargetHypothesis(hypotheses []diagnosis.Hypothesis) string {
+	bestID := ""
+	bestPriority := -1
+	bestConfidence := 2.0
+
+	for _, hypothesis := range hypotheses {
+		if hypothesis.ID == "" || hypothesis.Status == diagnosis.StatusRefuted {
+			continue
+		}
+
+		priority := 0
+		switch hypothesis.Status {
+		case diagnosis.StatusProposed:
+			priority = 3
+		case diagnosis.StatusInconclusive:
+			priority = 2
+		case diagnosis.StatusSupported:
+			priority = 1
+		default:
+			continue
+		}
+
+		if priority > bestPriority ||
+			(priority == bestPriority && hypothesis.Confidence < bestConfidence) {
+			bestID = hypothesis.ID
+			bestPriority = priority
+			bestConfidence = hypothesis.Confidence
+		}
+	}
+
+	return bestID
+}
+
+func findHypothesis(
+	hypotheses []diagnosis.Hypothesis,
+	id string,
+) *diagnosis.Hypothesis {
+	for i := range hypotheses {
+		if id != "" && hypotheses[i].ID == id {
+			return &hypotheses[i]
+		}
+	}
+	return nil
+}
+
+func newPlan(
+	toolName string,
+	rationale string,
+	targetHypothesisID string,
+	expectedObservation string,
+) InvestigationPlan {
+	return InvestigationPlan{
+		ToolName:            toolName,
+		Rationale:           rationale,
+		TargetHypothesisID:  targetHypothesisID,
+		ExpectedObservation: expectedObservation,
+	}
 }
 
 func containsAny(value string, keywords ...string) bool {
+	value = strings.ToLower(value)
 	for _, keyword := range keywords {
 		if strings.Contains(value, strings.ToLower(keyword)) {
 			return true
@@ -162,13 +369,12 @@ func containsAny(value string, keywords ...string) bool {
 
 func evidenceMentionsDependency(items []evidence.Evidence) bool {
 	for _, item := range items {
-		content := strings.ToLower(item.Content)
-		if containsAny(content,
+		if containsAny(
+			item.Content,
 			"payment-service",
 			"downstream",
 			"下游",
 			"依赖服务",
-			"latency elevated",
 		) {
 			return true
 		}

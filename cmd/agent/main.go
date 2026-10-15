@@ -15,20 +15,32 @@ import (
 
 	"github.com/liocoder/TraceMind/internal/agent"
 	"github.com/liocoder/TraceMind/internal/config"
+	"github.com/liocoder/TraceMind/internal/datasource/mock"
 	"github.com/liocoder/TraceMind/internal/llm"
+	"github.com/liocoder/TraceMind/internal/rag"
 	"github.com/liocoder/TraceMind/internal/tool"
 )
 
 func main() {
 	configPath := flag.String(
 		"config",
-		"config.yaml",
+		"config.local.yaml",
 		"Path to the configuration file",
 	)
 	incidentFlag := flag.String(
 		"incident",
 		"",
 		"Incident description to investigate",
+	)
+	datasetPath := flag.String(
+		"dataset",
+		"evals/datasets/observations.json",
+		"Path to the mock observation dataset",
+	)
+	scenarioID := flag.String(
+		"scenario",
+		"connection_pool_exhaustion",
+		"Mock runbooks scenario ID; this selects runbooks, not the incident intent",
 	)
 	flag.Parse()
 
@@ -60,17 +72,28 @@ func main() {
 		log.Fatalf("initialize LLM client: %v", err)
 	}
 
+	provider, err := mock.NewProvider(*datasetPath, *scenarioID)
+	if err != nil {
+		log.Fatalf("initialize mock runbooks provider: %v", err)
+	}
+
 	registry := tool.NewRegistry()
 
-	if err := registry.Register(&tool.MockLogSearch{}); err != nil {
+	if err := registry.Register(tool.NewLogsSearchTool(provider)); err != nil {
 		log.Fatalf("register log tool: %v", err)
 	}
 
-	if err := registry.Register(&tool.MockMetricsQuery{}); err != nil {
+	if err := registry.Register(tool.NewMetricsQueryTool(provider)); err != nil {
 		log.Fatalf("register metrics tool: %v", err)
 	}
 
+	retriever, err := rag.NewMarkdownRetriever("runbooks")
+	if err != nil {
+		log.Fatalf("initialize RAG: %v", err)
+	}
+
 	runtime := agent.NewRuntime(registry, client)
+	runtime.SetKnowledgeBase(retriever)
 
 	if cfg.Agent.MaxToolCalls > 0 {
 		runtime.SetMaxToolCalls(cfg.Agent.MaxToolCalls)
@@ -93,6 +116,10 @@ func main() {
 		time.Duration(timeoutSeconds)*time.Second,
 	)
 	defer cancel()
+
+	fmt.Printf("Investigating incident: %s\n", incident)
+	fmt.Printf("Mock dataset: %s\n", *datasetPath)
+	fmt.Printf("Mock scenario: %s\n\n", *scenarioID)
 
 	report, err := runtime.Run(ctx, incident)
 	if err != nil {

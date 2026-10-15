@@ -1,0 +1,328 @@
+
+{
+  "scenarios": {
+    "connection_pool_exhaustion": {
+      "metrics": [
+        {
+          "service": "order-service",
+          "timestamp": "2026-10-15T10:00:00Z",
+          "status": "degraded",
+          "values": {
+            "connection_pool_usage": {"value": 98, "unit": "%"},
+            "cpu_usage": {"value": 42, "unit": "%"},
+            "error_rate": {"value": 8.5, "unit": "%"},
+            "p95_latency_ms": {"value": 1850, "unit": "ms"}
+          }
+        }
+      ],
+      "logs": [
+        {
+          "timestamp": "2026-10-15T10:00:01Z",
+          "service": "order-service",
+          "level": "ERROR",
+          "message": "request timeout while acquiring database connection"
+        },
+        {
+          "timestamp": "2026-10-15T10:00:03Z",
+          "service": "order-service",
+          "level": "ERROR",
+          "message": "connection pool exhausted"
+        }
+      ]
+    },
+    "cpu_spike": {
+      "metrics": [
+        {
+          "service": "order-service",
+          "timestamp": "2026-10-15T10:10:00Z",
+          "status": "degraded",
+          "values": {
+            "connection_pool_usage": {"value": 35, "unit": "%"},
+            "cpu_usage": {"value": 99, "unit": "%"},
+            "error_rate": {"value": 12, "unit": "%"},
+            "p95_latency_ms": {"value": 2400, "unit": "ms"}
+          }
+        }
+      ],
+      "logs": [
+        {
+          "timestamp": "2026-10-15T10:10:01Z",
+          "service": "order-service",
+          "level": "WARN",
+          "message": "CPU utilization above 95 percent for five minutes"
+        },
+        {
+          "timestamp": "2026-10-15T10:10:02Z",
+          "service": "order-service",
+          "level": "ERROR",
+          "message": "request processing delayed under high CPU load"
+        }
+      ]
+    },
+    "downstream_timeout": {
+      "metrics": [
+        {
+          "service": "order-service",
+          "timestamp": "2026-10-15T10:20:00Z",
+          "status": "degraded",
+          "values": {
+            "connection_pool_usage": {"value": 91, "unit": "%"},
+            "cpu_usage": {"value": 38, "unit": "%"},
+            "error_rate": {"value": 10, "unit": "%"},
+            "p95_latency_ms": {"value": 3200, "unit": "ms"}
+          }
+        },
+        {
+          "service": "payment-service",
+          "timestamp": "2026-10-15T10:20:00Z",
+          "status": "degraded",
+          "values": {
+            "p95_latency_ms": {"value": 4800, "unit": "ms"},
+            "error_rate": {"value": 18, "unit": "%"},
+            "cpu_usage": {"value": 40, "unit": "%"}
+          }
+        }
+      ],
+      "logs": [
+        {
+          "timestamp": "2026-10-15T10:20:01Z",
+          "service": "order-service",
+          "level": "ERROR",
+          "message": "downstream payment-service request timeout"
+        },
+        {
+          "timestamp": "2026-10-15T10:20:02Z",
+          "service": "payment-service",
+          "level": "ERROR",
+          "message": "payment request exceeded upstream timeout deadline"
+        }
+      ]
+    },
+    "database_slow_query": {
+      "metrics": [
+        {
+          "service": "order-service",
+          "timestamp": "2026-10-15T10:30:00Z",
+          "status": "degraded",
+          "values": {
+            "connection_pool_usage": {"value": 94, "unit": "%"},
+            "cpu_usage": {"value": 45, "unit": "%"},
+            "error_rate": {"value": 7, "unit": "%"},
+            "p95_latency_ms": {"value": 2800, "unit": "ms"}
+          }
+        },
+        {
+          "service": "database",
+          "timestamp": "2026-10-15T10:30:00Z",
+          "status": "degraded",
+          "values": {
+            "query_latency_ms": {"value": 2200, "unit": "ms"},
+            "cpu_usage": {"value": 88, "unit": "%"},
+            "active_queries": {"value": 240, "unit": "count"}
+          }
+        }
+      ],
+      "logs": [
+        {
+          "timestamp": "2026-10-15T10:30:01Z",
+          "service": "database",
+          "level": "WARN",
+          "message": "slow query exceeded 2000ms"
+        },
+        {
+          "timestamp": "2026-10-15T10:30:02Z",
+          "service": "order-service",
+          "level": "ERROR",
+          "message": "database query timeout while processing order"
+        }
+      ]
+    },
+    "redis_latency": {
+      "metrics": [
+        {
+          "service": "order-service",
+          "timestamp": "2026-10-15T10:40:00Z",
+          "status": "degraded",
+          "values": {
+            "connection_pool_usage": {"value": 48, "unit": "%"},
+            "cpu_usage": {"value": 36, "unit": "%"},
+            "error_rate": {"value": 6, "unit": "%"},
+            "p95_latency_ms": {"value": 1700, "unit": "ms"}
+          }
+        },
+        {
+          "service": "redis",
+          "timestamp": "2026-10-15T10:40:00Z",
+          "status": "degraded",
+          "values": {
+            "command_latency_ms": {"value": 950, "unit": "ms"},
+            "error_rate": {"value": 14, "unit": "%"}
+          }
+        }
+      ],
+      "logs": [
+        {
+          "timestamp": "2026-10-15T10:40:01Z",
+          "service": "order-service",
+          "level": "WARN",
+          "message": "cache lookup latency increased"
+        },
+        {
+          "timestamp": "2026-10-15T10:40:02Z",
+          "service": "redis",
+          "level": "ERROR",
+          "message": "redis command timeout and elevated command latency"
+        }
+      ]
+    },
+    "traffic_spike": {
+      "metrics": [
+        {
+          "service": "api-gateway",
+          "timestamp": "2026-10-15T10:50:00Z",
+          "status": "degraded",
+          "values": {
+            "request_rate": {"value": 12000, "unit": "requests/s"},
+            "baseline_request_rate": {"value": 3000, "unit": "requests/s"},
+            "error_rate": {"value": 9, "unit": "%"},
+            "p95_latency_ms": {"value": 2100, "unit": "ms"}
+          }
+        },
+        {
+          "service": "order-service",
+          "timestamp": "2026-10-15T10:50:00Z",
+          "status": "degraded",
+          "values": {
+            "connection_pool_usage": {"value": 92, "unit": "%"},
+            "cpu_usage": {"value": 78, "unit": "%"},
+            "error_rate": {"value": 8, "unit": "%"}
+          }
+        }
+      ],
+      "logs": [
+        {
+          "timestamp": "2026-10-15T10:50:01Z",
+          "service": "api-gateway",
+          "level": "WARN",
+          "message": "request rate increased to four times baseline"
+        },
+        {
+          "timestamp": "2026-10-15T10:50:02Z",
+          "service": "order-service",
+          "level": "ERROR",
+          "message": "request rejected after connection pool reached capacity"
+        }
+      ]
+    },
+    "high_errors_normal_resources": {
+      "metrics": [
+        {
+          "service": "order-service",
+          "timestamp": "2026-10-15T11:00:00Z",
+          "status": "degraded",
+          "values": {
+            "connection_pool_usage": {"value": 32, "unit": "%"},
+            "cpu_usage": {"value": 28, "unit": "%"},
+            "error_rate": {"value": 22, "unit": "%"},
+            "p95_latency_ms": {"value": 650, "unit": "ms"}
+          }
+        }
+      ],
+      "logs": [
+        {
+          "timestamp": "2026-10-15T11:00:01Z",
+          "service": "order-service",
+          "level": "ERROR",
+          "message": "business validation failed due to invalid order state"
+        },
+        {
+          "timestamp": "2026-10-15T11:00:02Z",
+          "service": "order-service",
+          "level": "ERROR",
+          "message": "request rejected because required business field is missing"
+        }
+      ]
+    },
+    "conflicting_signals": {
+      "metrics": [
+        {
+          "service": "order-service",
+          "timestamp": "2026-10-15T11:10:00Z",
+          "status": "healthy",
+          "values": {
+            "connection_pool_usage": {"value": 30, "unit": "%"},
+            "cpu_usage": {"value": 25, "unit": "%"},
+            "error_rate": {"value": 0.2, "unit": "%"},
+            "p95_latency_ms": {"value": 180, "unit": "ms"}
+          }
+        }
+      ],
+      "logs": [
+        {
+          "timestamp": "2026-10-15T11:10:01Z",
+          "service": "order-service",
+          "level": "ERROR",
+          "message": "connection pool exhausted"
+        },
+        {
+          "timestamp": "2026-10-15T11:10:02Z",
+          "service": "order-service",
+          "level": "ERROR",
+          "message": "request timeout reported by one application instance"
+        }
+      ]
+    },
+    "insufficient_evidence": {
+      "metrics": [
+        {
+          "service": "order-service",
+          "timestamp": "2026-10-15T11:20:00Z",
+          "status": "healthy",
+          "values": {
+            "connection_pool_usage": {"value": 40, "unit": "%"},
+            "cpu_usage": {"value": 35, "unit": "%"},
+            "error_rate": {"value": 1, "unit": "%"},
+            "p95_latency_ms": {"value": 300, "unit": "ms"}
+          }
+        }
+      ],
+      "logs": [
+        {
+          "timestamp": "2026-10-15T11:20:01Z",
+          "service": "order-service",
+          "level": "WARN",
+          "message": "intermittent request latency reported without additional diagnostic details"
+        }
+      ]
+    },
+    "multiple_anomalies": {
+      "metrics": [
+        {
+          "service": "order-service",
+          "timestamp": "2026-10-15T11:30:00Z",
+          "status": "degraded",
+          "values": {
+            "connection_pool_usage": {"value": 97, "unit": "%"},
+            "cpu_usage": {"value": 96, "unit": "%"},
+            "error_rate": {"value": 16, "unit": "%"},
+            "p95_latency_ms": {"value": 3500, "unit": "ms"}
+          }
+        }
+      ],
+      "logs": [
+        {
+          "timestamp": "2026-10-15T11:30:01Z",
+          "service": "order-service",
+          "level": "ERROR",
+          "message": "connection pool exhausted during high CPU load"
+        },
+        {
+          "timestamp": "2026-10-15T11:30:02Z",
+          "service": "order-service",
+          "level": "WARN",
+          "message": "request queue length increased significantly"
+        }
+      ]
+    }
+  }
+}

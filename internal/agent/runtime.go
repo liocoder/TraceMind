@@ -11,6 +11,7 @@ import (
 	"github.com/liocoder/TraceMind/internal/diagnosis"
 	"github.com/liocoder/TraceMind/internal/evidence"
 	"github.com/liocoder/TraceMind/internal/llm"
+	"github.com/liocoder/TraceMind/internal/rag"
 	"github.com/liocoder/TraceMind/internal/tool"
 )
 
@@ -24,6 +25,10 @@ type Report struct {
 	Evidence            []evidence.Evidence    `json:"evidence"`
 	Plans               []InvestigationPlan    `json:"plans,omitempty"`
 	DiagnosisHypotheses []diagnosis.Hypothesis `json:"diagnosis_hypotheses,omitempty"`
+
+	// Knowledge 保存最终使用的参考知识，便于审计来源。
+	// 这些条目不属于 Evidence，不参与当前事故证据计数。
+	Knowledge []rag.Document `json:"knowledge,omitempty"`
 }
 
 type completionClient interface {
@@ -35,10 +40,11 @@ type completionClient interface {
 }
 
 type Runtime struct {
-	tools        *tool.Registry
-	client       completionClient
-	planner      Planner
-	maxToolCalls int
+	tools         *tool.Registry
+	client        completionClient
+	planner       Planner
+	maxToolCalls  int
+	knowledgeBase rag.Retriever
 }
 
 func NewRuntime(
@@ -52,28 +58,32 @@ func NewRuntime(
 	return newRuntime(tools, client)
 }
 
-func newRuntime(
-	tools *tool.Registry,
-	client completionClient,
-) *Runtime {
+func newRuntime(tools *tool.Registry, client completionClient) *Runtime {
 	return &Runtime{
 		tools:   tools,
 		client:  client,
-		planner: NewPlanner(),
+		planner: NewPlanner(client),
 	}
 }
 
 func (r *Runtime) SetPlanner(planner Planner) {
-	if r != nil {
+	if r != nil && planner != nil {
 		r.planner = planner
 	}
 }
 
 // SetMaxToolCalls 设置单次事件调查允许执行的最大工具调用次数。
-// 配置默认值由 config.Load() 统一负责。
 func (r *Runtime) SetMaxToolCalls(max int) {
 	if r != nil && max > 0 {
 		r.maxToolCalls = max
+	}
+}
+
+// SetKnowledgeBase 设置可选的 RAG 检索器。
+// 不配置知识库时，Runtime 保留原有诊断能力。
+func (r *Runtime) SetKnowledgeBase(retriever rag.Retriever) {
+	if r != nil {
+		r.knowledgeBase = retriever
 	}
 }
 
@@ -125,6 +135,7 @@ func (r *Runtime) Run(
 		Evidence:            []evidence.Evidence{},
 		Plans:               []InvestigationPlan{},
 		DiagnosisHypotheses: []diagnosis.Hypothesis{},
+		Knowledge:           []rag.Document{},
 	}
 
 	toolCallsUsed := 0
@@ -157,6 +168,24 @@ func (r *Runtime) Run(
 		return fail(err)
 	}
 
+	// 初次检索：提供调查方向，不创建当前事故 Evidence。
+	var knowledge []rag.Document
+
+	if r.knowledgeBase != nil {
+		query := buildKnowledgeQuery(incident, nil, nil)
+		retrieved, searchErr := r.knowledgeBase.Search(ctx, query, 3)
+		if searchErr != nil {
+			fmt.Printf(
+				"[TraceMind] RAG initial retrieval warning: %v\n",
+				searchErr,
+			)
+		} else {
+			knowledge = retrieved
+		}
+	}
+
+	report.Knowledge = knowledge
+
 	systemPrompt := `You are TraceMind, an evidence-driven incident diagnosis agent.
 
 Investigate incidents using the available tools.
@@ -169,6 +198,11 @@ If evidence is insufficient, clearly state the uncertainty.
 Follow the investigation plan provided for each round.
 Only use the tool permitted by the current plan.
 If the evidence is sufficient, return a final diagnosis without calling tools.
+
+Reference knowledge from the RAG knowledge base is background guidance only.
+It is not an observation from the current incident.
+Never cite a runbook or historical incident as proof that its cause applies here.
+Use current incident tool results to support or refute root-cause hypotheses.
 
 When finished, return valid JSON only:
 {
@@ -188,6 +222,13 @@ Do not include Markdown code fences around the JSON.`
 			Role:    "user",
 			Content: "Investigate this incident: " + incident,
 		},
+	}
+
+	if len(knowledge) > 0 {
+		messages = append(messages, llm.Message{
+			Role:    "system",
+			Content: formatKnowledgeContext(knowledge),
+		})
 	}
 
 	// 每轮最多执行一个工具调用。
@@ -227,6 +268,7 @@ Do not include Markdown code fences around the JSON.`
 				Hypotheses:    diagnosisManager.List(),
 				Tools:         candidates,
 				ToolCallCount: toolCallCount,
+				Knowledge:     knowledge,
 			})
 
 			if err != nil {
@@ -322,6 +364,7 @@ Do not include Markdown code fences around the JSON.`
 			}
 
 			report.ToolCalls = toolCallsUsed
+			report.Knowledge = knowledge
 			return report, nil
 		}
 
@@ -468,7 +511,7 @@ Do not include Markdown code fences around the JSON.`
 			}
 		}
 
-		// 保存证据，并在本次事件范围内生成唯一 ID。
+		// 保存当前事故证据，并在本次事件范围内生成唯一 ID。
 		for _, item := range execution.Evidence {
 			item.ID = fmt.Sprintf("ev-%03d", len(report.Evidence)+1)
 			if item.CreatedAt.IsZero() {
@@ -510,6 +553,39 @@ Do not include Markdown code fences around the JSON.`
 					"A supported hypothesis is not automatically a " +
 					"confirmed root cause.",
 			})
+		}
+
+		// 新证据可能改变检索方向，因此重新检索。
+		// 检索失败时保留上一轮知识，不能影响事故诊断主流程。
+		if r.knowledgeBase != nil && len(execution.Evidence) > 0 {
+			query := buildKnowledgeQuery(
+				incident,
+				evidenceStore.List(),
+				diagnosisManager.List(),
+			)
+
+			updatedKnowledge, searchErr := r.knowledgeBase.Search(
+				ctx,
+				query,
+				3,
+			)
+
+			if searchErr != nil {
+				fmt.Printf(
+					"[TraceMind] RAG refresh warning: %v\n",
+					searchErr,
+				)
+			} else {
+				knowledge = updatedKnowledge
+				report.Knowledge = knowledge
+
+				if len(knowledge) > 0 {
+					messages = append(messages, llm.Message{
+						Role:    "system",
+						Content: formatKnowledgeContext(knowledge),
+					})
+				}
+			}
 		}
 
 		if err := transition(StateObserving); err != nil {
@@ -602,4 +678,87 @@ func applyFinalAnswer(report *Report, content string) error {
 	report.Summary = result.Summary
 	report.Hypotheses = result.Hypotheses
 	return nil
+}
+
+// buildKnowledgeQuery 将事故描述、最新证据和候选假设组合为检索查询。
+// 查询内容用于寻找参考资料，不会被写入 Evidence Store。
+func buildKnowledgeQuery(
+	incident string,
+	items []evidence.Evidence,
+	hypotheses []diagnosis.Hypothesis,
+) string {
+	var parts []string
+
+	if incident = strings.TrimSpace(incident); incident != "" {
+		parts = append(parts, incident)
+	}
+
+	// 限制查询长度，只取最近的五条证据。
+	start := 0
+	if len(items) > 5 {
+		start = len(items) - 5
+	}
+
+	for _, item := range items[start:] {
+		content := strings.TrimSpace(item.Content)
+		if content != "" {
+			parts = append(parts, content)
+		}
+	}
+
+	// 未被反驳的假设仅作为检索词，不能视为已确认事实。
+	count := 0
+	for _, hypothesis := range hypotheses {
+		if hypothesis.Status == diagnosis.StatusRefuted {
+			continue
+		}
+
+		title := strings.TrimSpace(hypothesis.Title)
+		description := strings.TrimSpace(hypothesis.Description)
+
+		if title == "" && description == "" {
+			continue
+		}
+
+		parts = append(parts, title+" "+description)
+		count++
+		if count >= 3 {
+			break
+		}
+	}
+
+	return strings.Join(parts, "\n")
+}
+
+func formatKnowledgeContext(documents []rag.Document) string {
+	if len(documents) == 0 {
+		return "No relevant reference knowledge was retrieved."
+	}
+
+	var builder strings.Builder
+
+	builder.WriteString(
+		"Reference knowledge retrieved from the local RAG knowledge base:\n",
+	)
+	builder.WriteString(
+		"These documents are reference material, NOT observations from the current incident.\n",
+	)
+	builder.WriteString(
+		"Use them to guide investigation and tool selection. " +
+			"Never treat them as proof of the current root cause.\n\n",
+	)
+
+	for i, doc := range documents {
+		fmt.Fprintf(
+			&builder,
+			"[Reference %d]\nSource: %s\nTitle: %s\nID: %s\nContent:\n%s\n\n",
+			i+1,
+			doc.Source,
+			doc.Title,
+			doc.ID,
+			doc.Content,
+		)
+	}
+
+	return builder.String()
 }

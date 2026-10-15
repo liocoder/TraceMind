@@ -1,0 +1,140 @@
+{
+  "cases": [
+    {
+      "id": "connection_pool_exhaustion",
+      "incident": "The order service has elevated P99 latency and some requests return HTTP 502. Investigate the likely cause.",
+      "expected_keywords": [
+        "connection pool",
+        "pool exhaustion",
+        "pool exhausted"
+      ],
+      "forbidden_keywords": [
+        "CPU saturation is confirmed as the root cause"
+      ],
+      "expected_tool_calls_max": 4
+    },
+    {
+      "id": "cpu_spike",
+      "incident": "The order service is slow and its error rate has increased. Investigate the likely cause.",
+      "expected_keywords": [
+        "CPU",
+        "cpu"
+      ],
+      "forbidden_keywords": [
+        "connection leak is confirmed",
+        "database is confirmed as the root cause"
+      ],
+      "expected_tool_calls_max": 4
+    },
+    {
+      "id": "downstream_timeout",
+      "incident": "The order service is slow and returns errors. Investigate whether a dependency is involved.",
+      "expected_keywords": [
+        "payment-service",
+        "downstream",
+        "dependency"
+      ],
+      "forbidden_keywords": [
+        "connection leak is confirmed"
+      ],
+      "expected_tool_calls_max": 5
+    },
+    {
+      "id": "database_slow_query",
+      "incident": "Order requests are slow and sometimes time out. Investigate the likely cause.",
+      "expected_keywords": [
+        "slow query",
+        "database",
+        "query latency"
+      ],
+      "forbidden_keywords": [
+        "connection leak is confirmed"
+      ],
+      "expected_tool_calls_max": 5
+    },
+    {
+      "id": "redis_latency",
+      "incident": "The order service has increased latency. Investigate whether cache access may be involved.",
+      "expected_keywords": [
+        "redis",
+        "cache"
+      ],
+      "forbidden_keywords": [
+        "connection leak is confirmed"
+      ],
+      "expected_tool_calls_max": 5
+    },
+    {
+      "id": "traffic_spike",
+      "incident": "The API gateway and order service are degraded. Investigate the likely cause.",
+      "expected_keywords": [
+        "traffic",
+        "request rate",
+        "load spike"
+      ],
+      "forbidden_keywords": [
+        "connection leak is confirmed"
+      ],
+      "expected_tool_calls_max": 5
+    },
+    {
+      "id": "high_errors_normal_resources",
+      "incident": "The order service has a high error rate. Investigate the likely cause.",
+      "expected_keywords": [
+        "validation",
+        "business",
+        "invalid order"
+      ],
+      "forbidden_keywords": [
+        "CPU saturation is confirmed",
+        "connection pool exhaustion is confirmed"
+      ],
+      "expected_tool_calls_max": 4
+    },
+    {
+      "id": "conflicting_signals",
+      "incident": "The order service logs report connection pool exhaustion, but the metrics look healthy. Investigate the discrepancy.",
+      "expected_keywords": [
+        "discrepancy",
+        "inconsistent",
+        "conflict",
+        "single application instance",
+        "not confirmed",
+        "not yet investigated"
+      ],
+      "forbidden_keywords": [
+        "connection pool exhaustion is definitively confirmed as the root cause"
+      ],
+      "expected_tool_calls_max": 5
+    },
+    {
+      "id": "insufficient_evidence",
+      "incident": "The order service reportedly has intermittent latency. Investigate the root cause.",
+      "expected_keywords": [
+        "no root cause can be confirmed",
+        "no evidence-backed fault mechanism",
+        "insufficient",
+        "cannot determine",
+        "not enough evidence",
+        "uncertain"
+      ],
+      "forbidden_keywords": [
+        "connection leak is confirmed",
+        "database failure is confirmed"
+      ],
+      "expected_tool_calls_max": 4
+    },
+    {
+      "id": "multiple_anomalies",
+      "incident": "The order service has high latency, a high error rate, high CPU usage, and high connection pool utilization. Investigate the likely failure mechanism and remaining uncertainty.",
+      "expected_keywords": [
+        "connection pool",
+        "CPU"
+      ],
+      "forbidden_keywords": [
+        "connection leak is confirmed"
+      ],
+      "expected_tool_calls_max": 5
+    }
+  ]
+}

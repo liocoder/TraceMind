@@ -4,12 +4,34 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
+	"github.com/liocoder/TraceMind/internal/datasource/mock"
 	"github.com/liocoder/TraceMind/internal/llm"
 	"github.com/liocoder/TraceMind/internal/tool"
 )
+
+// testObservationDataset 提供测试所需的固定 mock 观察数据。
+const testObservationDataset = `{
+  "scenarios": {
+    "default": {
+      "metrics": [
+        {
+          "service": "order-service",
+          "timestamp": "2026-10-01T00:00:00Z",
+          "status": "degraded",
+          "values": {
+            "error_rate": {"value": 0.15, "unit": "%"}
+          }
+        }
+      ],
+      "logs": []
+    }
+  }
+}`
 
 // fakeCompletionClient 用于在测试中模拟 LLM，避免调用真实 API。
 type fakeCompletionClient struct {
@@ -43,14 +65,28 @@ func newTestRuntime(
 ) *Runtime {
 	t.Helper()
 
-	registry := tool.NewRegistry()
-
-	if err := registry.Register(&tool.MockLogSearch{}); err != nil {
-		t.Fatalf("register mock log search tool: %v", err)
+	datasetPath := filepath.Join(t.TempDir(), "observations.json")
+	if err := os.WriteFile(
+		datasetPath,
+		[]byte(testObservationDataset),
+		0o644,
+	); err != nil {
+		t.Fatalf("write mock observation dataset: %v", err)
 	}
 
-	if err := registry.Register(&tool.MockMetricsQuery{}); err != nil {
-		t.Fatalf("register mock metrics query tool: %v", err)
+	provider, err := mock.NewProvider(datasetPath, "default")
+	if err != nil {
+		t.Fatalf("initialize mock runbooks provider: %v", err)
+	}
+
+	registry := tool.NewRegistry()
+
+	if err := registry.Register(tool.NewLogsSearchTool(provider)); err != nil {
+		t.Fatalf("register log search tool: %v", err)
+	}
+
+	if err := registry.Register(tool.NewMetricsQueryTool(provider)); err != nil {
+		t.Fatalf("register metrics query tool: %v", err)
 	}
 
 	runtime := newRuntime(registry, client)
@@ -106,7 +142,24 @@ func TestRuntimeCompletesDiagnosis(t *testing.T) {
 		messages []llm.Message,
 		definitions []llm.ToolDefinition,
 	) (*llm.Completion, error) {
-		if client.calls == 1 {
+		// Planner 阶段：返回规划器需要的 JSON，而不是工具调用。
+		if len(definitions) == 0 {
+			return &llm.Completion{
+				Message: llm.Message{
+					Role: "assistant",
+					Content: `{
+						"action": "CALL_TOOL",
+						"tool_name": "query_metrics",
+						"rationale": "Inspect order-service metrics to investigate the reported timeouts.",
+						"expected_observation": "Observe service status and error rate."
+					}`,
+				},
+				FinishReason: "stop",
+			}, nil
+		}
+
+		// Runtime 阶段：根据是否已经执行过工具，决定返回工具调用或最终诊断。
+		if client.calls == 2 {
 			return &llm.Completion{
 				Message: llm.Message{
 					Role: "assistant",
