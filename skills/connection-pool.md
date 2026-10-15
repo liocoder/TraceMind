@@ -1,5 +1,7 @@
-
 ---
+name: connection_pool
+description: 排查数据库连接池耗尽导致的请求超时、连接获取失败与 502
+triggers: connection pool, connection_pool, active_connections, 连接池, 连接耗尽, 获取连接超时
 recommended_tools: query_metrics, search_logs
 ---
 

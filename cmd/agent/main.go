@@ -17,7 +17,7 @@ import (
 	"github.com/liocoder/TraceMind/internal/config"
 	"github.com/liocoder/TraceMind/internal/datasource/mock"
 	"github.com/liocoder/TraceMind/internal/llm"
-	"github.com/liocoder/TraceMind/internal/rag"
+	"github.com/liocoder/TraceMind/internal/skills"
 	"github.com/liocoder/TraceMind/internal/tool"
 )
 
@@ -40,7 +40,12 @@ func main() {
 	scenarioID := flag.String(
 		"scenario",
 		"connection_pool_exhaustion",
-		"Mock runbooks scenario ID; this selects runbooks, not the incident intent",
+		"Scenario ID in the mock observation dataset",
+	)
+	skillsPath := flag.String(
+		"skills",
+		"skills",
+		"Path to the investigation skills directory",
 	)
 	flag.Parse()
 
@@ -74,7 +79,12 @@ func main() {
 
 	provider, err := mock.NewProvider(*datasetPath, *scenarioID)
 	if err != nil {
-		log.Fatalf("initialize mock runbooks provider: %v", err)
+		log.Fatalf("initialize mock provider: %v", err)
+	}
+
+	library, err := skills.Load(*skillsPath)
+	if err != nil {
+		log.Fatalf("initialize skills library: %v", err)
 	}
 
 	registry := tool.NewRegistry()
@@ -87,16 +97,19 @@ func main() {
 		log.Fatalf("register metrics tool: %v", err)
 	}
 
-	retriever, err := rag.NewMarkdownRetriever("runbooks")
-	if err != nil {
-		log.Fatalf("initialize RAG: %v", err)
+	if err := registry.Register(tool.NewLoadSkillTool(library)); err != nil {
+		log.Fatalf("register load_skill tool: %v", err)
 	}
 
 	runtime := agent.NewRuntime(registry, client)
-	runtime.SetKnowledgeBase(retriever)
+	runtime.SetSkillsLibrary(library)
 
 	if cfg.Agent.MaxToolCalls > 0 {
 		runtime.SetMaxToolCalls(cfg.Agent.MaxToolCalls)
+	}
+
+	if cfg.Agent.MaxTokens > 0 {
+		runtime.SetMaxTokens(cfg.Agent.MaxTokens)
 	}
 
 	timeoutSeconds := cfg.Agent.TimeoutSeconds

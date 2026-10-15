@@ -112,6 +112,10 @@
       "incident": "The order service reportedly has intermittent latency. Investigate the root cause.",
       "expected_keywords": [
         "no root cause can be confirmed",
+        "could not confirm",
+        "cannot be confirmed",
+        "undetermined",
+        "inconclusive",
         "no evidence-backed fault mechanism",
         "insufficient",
         "cannot determine",

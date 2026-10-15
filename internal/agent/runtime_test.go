@@ -76,7 +76,7 @@ func newTestRuntime(
 
 	provider, err := mock.NewProvider(datasetPath, "default")
 	if err != nil {
-		t.Fatalf("initialize mock runbooks provider: %v", err)
+		t.Fatalf("initialize mock provider: %v", err)
 	}
 
 	registry := tool.NewRegistry()

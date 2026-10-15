@@ -11,7 +11,7 @@ import (
 	"github.com/liocoder/TraceMind/internal/diagnosis"
 	"github.com/liocoder/TraceMind/internal/evidence"
 	"github.com/liocoder/TraceMind/internal/llm"
-	"github.com/liocoder/TraceMind/internal/rag"
+	"github.com/liocoder/TraceMind/internal/skills"
 	"github.com/liocoder/TraceMind/internal/tool"
 )
 
@@ -26,9 +26,9 @@ type Report struct {
 	Plans               []InvestigationPlan    `json:"plans,omitempty"`
 	DiagnosisHypotheses []diagnosis.Hypothesis `json:"diagnosis_hypotheses,omitempty"`
 
-	// Knowledge 保存最终使用的参考知识，便于审计来源。
+	// Knowledge 保存最终使用的参考技能，便于审计来源。
 	// 这些条目不属于 Evidence，不参与当前事故证据计数。
-	Knowledge []rag.Document `json:"knowledge,omitempty"`
+	Knowledge []SkillReference `json:"knowledge,omitempty"`
 }
 
 type completionClient interface {
@@ -40,11 +40,12 @@ type completionClient interface {
 }
 
 type Runtime struct {
-	tools         *tool.Registry
-	client        completionClient
-	planner       Planner
-	maxToolCalls  int
-	knowledgeBase rag.Retriever
+	tools        *tool.Registry
+	client       completionClient
+	planner      Planner
+	maxToolCalls int
+	maxTokens    int
+	skills       *skills.Library
 }
 
 func NewRuntime(
@@ -79,11 +80,19 @@ func (r *Runtime) SetMaxToolCalls(max int) {
 	}
 }
 
-// SetKnowledgeBase 设置可选的 RAG 检索器。
-// 不配置知识库时，Runtime 保留原有诊断能力。
-func (r *Runtime) SetKnowledgeBase(retriever rag.Retriever) {
+// SetMaxTokens 设置单次事件调查允许的估算 token 硬上限。
+// 不设置或小于等于 0 时不启用 token 预算。
+func (r *Runtime) SetMaxTokens(max int) {
+	if r != nil && max > 0 {
+		r.maxTokens = max
+	}
+}
+
+// SetSkillsLibrary 设置可选的三级技能库。
+// 不配置技能库时，Runtime 保留原有诊断能力。
+func (r *Runtime) SetSkillsLibrary(lib *skills.Library) {
 	if r != nil {
-		r.knowledgeBase = retriever
+		r.skills = lib
 	}
 }
 
@@ -135,7 +144,7 @@ func (r *Runtime) Run(
 		Evidence:            []evidence.Evidence{},
 		Plans:               []InvestigationPlan{},
 		DiagnosisHypotheses: []diagnosis.Hypothesis{},
-		Knowledge:           []rag.Document{},
+		Knowledge:           []SkillReference{},
 	}
 
 	toolCallsUsed := 0
@@ -168,23 +177,17 @@ func (r *Runtime) Run(
 		return fail(err)
 	}
 
-	// 初次检索：提供调查方向，不创建当前事故 Evidence。
-	var knowledge []rag.Document
+	// 技能上下文：L1 索引常驻，L2 摘要按事故描述命中注入。
+	// 技能属于参考知识，不创建当前事故 Evidence。
+	var skillRefs []SkillReference
+	var skillBriefs []SkillBrief
+	var loader *skillLoader
 
-	if r.knowledgeBase != nil {
-		query := buildKnowledgeQuery(incident, nil, nil)
-		retrieved, searchErr := r.knowledgeBase.Search(ctx, query, 3)
-		if searchErr != nil {
-			fmt.Printf(
-				"[TraceMind] RAG initial retrieval warning: %v\n",
-				searchErr,
-			)
-		} else {
-			knowledge = retrieved
-		}
+	if r.skills != nil {
+		loader = newSkillLoader(maxLoadedSkills)
 	}
 
-	report.Knowledge = knowledge
+	report.Knowledge = skillRefs
 
 	systemPrompt := `You are TraceMind, an evidence-driven incident diagnosis agent.
 
@@ -199,9 +202,9 @@ Follow the investigation plan provided for each round.
 Only use the tool permitted by the current plan.
 If the evidence is sufficient, return a final diagnosis without calling tools.
 
-Reference knowledge from the RAG knowledge base is background guidance only.
+Reference skill knowledge is background guidance only.
 It is not an observation from the current incident.
-Never cite a runbook or historical incident as proof that its cause applies here.
+Never cite a skill or historical incident as proof that its cause applies here.
 Use current incident tool results to support or refute root-cause hypotheses.
 
 When finished, return valid JSON only:
@@ -224,11 +227,27 @@ Do not include Markdown code fences around the JSON.`
 		},
 	}
 
-	if len(knowledge) > 0 {
+	if r.skills != nil && loader != nil {
 		messages = append(messages, llm.Message{
 			Role:    "system",
-			Content: formatKnowledgeContext(knowledge),
+			Content: r.skills.Index(),
 		})
+
+		skillMessage, refs, briefs := buildSkillContext(
+			r.skills,
+			buildKnowledgeQuery(incident, nil, nil),
+			loader,
+		)
+		if skillMessage != "" {
+			messages = append(messages, llm.Message{
+				Role:    "system",
+				Content: skillMessage,
+			})
+		}
+
+		skillRefs = refs
+		skillBriefs = briefs
+		report.Knowledge = skillRefs
 	}
 
 	// 每轮最多执行一个工具调用。
@@ -268,11 +287,18 @@ Do not include Markdown code fences around the JSON.`
 				Hypotheses:    diagnosisManager.List(),
 				Tools:         candidates,
 				ToolCallCount: toolCallCount,
-				Knowledge:     knowledge,
+				Knowledge:     skillBriefs,
 			})
 
 			if err != nil {
 				if errors.Is(err, ErrNoUsefulAction) {
+					forceFinal = true
+				} else if errors.Is(err, ErrPlannerDegraded) {
+					// 模型输出/API 瞬态异常：不终止整个调查，改为优雅终局。
+					fmt.Printf(
+						"[TraceMind] planner degraded (%v); closing investigation\n",
+						err,
+					)
 					forceFinal = true
 				} else {
 					return fail(fmt.Errorf("plan investigation: %w", err))
@@ -320,6 +346,31 @@ Do not include Markdown code fences around the JSON.`
 			forceFinal = true
 		}
 
+		// token 预算：超出硬上限后强制终局，最多再允许一次最终诊断调用。
+		if r.maxTokens > 0 {
+			estimated := estimateMessagesTokens(messages) +
+				estimateToolDefinitionsTokens(availableTools)
+
+			if estimated > r.maxTokens {
+				if forceFinal {
+					return fail(fmt.Errorf(
+						"token budget exceeded: estimated %d > %d tokens",
+						estimated,
+						r.maxTokens,
+					))
+				}
+
+				fmt.Printf(
+					"[TraceMind] token budget exceeded "+
+						"(estimated %d/%d); closing investigation\n",
+					estimated,
+					r.maxTokens,
+				)
+				forceFinal = true
+				availableTools = nil
+			}
+		}
+
 		if forceFinal && !finalPromptAdded {
 			messages = append(messages, llm.Message{
 				Role: "system",
@@ -364,7 +415,7 @@ Do not include Markdown code fences around the JSON.`
 			}
 
 			report.ToolCalls = toolCallsUsed
-			report.Knowledge = knowledge
+			report.Knowledge = skillRefs
 			return report, nil
 		}
 
@@ -511,6 +562,28 @@ Do not include Markdown code fences around the JSON.`
 			}
 		}
 
+		// 记录技能加载状态：load_skill 计入加载预算，容量满时按 LRU 淘汰。
+		// 技能内容作为参考知识注入后续轮次，不进入证据存储。
+		if plan.ToolName == "load_skill" && loader != nil {
+			for _, call := range calls[:allowedCount] {
+				name := parseLoadSkillName(call.Function.Arguments)
+				if name == "" {
+					continue
+				}
+
+				if evicted := loader.Load(name); evicted != "" {
+					fmt.Printf(
+						"[TraceMind] skill loaded=%q evicted=%q (max %d)\n",
+						name,
+						evicted,
+						loader.max,
+					)
+				} else {
+					fmt.Printf("[TraceMind] skill loaded=%q\n", name)
+				}
+			}
+		}
+
 		// 保存当前事故证据，并在本次事件范围内生成唯一 ID。
 		for _, item := range execution.Evidence {
 			item.ID = fmt.Sprintf("ev-%03d", len(report.Evidence)+1)
@@ -525,6 +598,7 @@ Do not include Markdown code fences around the JSON.`
 		}
 
 		// 工具调用轮次结束后，再统一评估假设。
+		// 评估失败不终止调查：保留上一轮假设评估，仅打印告警。
 		if len(execution.Evidence) > 0 {
 			if err := evaluateHypotheses(
 				ctx,
@@ -533,59 +607,54 @@ Do not include Markdown code fences around the JSON.`
 				evidenceStore,
 				diagnosisManager,
 			); err != nil {
-				return fail(fmt.Errorf("evaluate hypotheses: %w", err))
-			}
-
-			report.DiagnosisHypotheses = diagnosisManager.List()
-
-			hypothesisJSON, err := json.Marshal(
-				report.DiagnosisHypotheses,
-			)
-			if err != nil {
-				return fail(fmt.Errorf("marshal hypotheses: %w", err))
-			}
-
-			messages = append(messages, llm.Message{
-				Role: "system",
-				Content: "Updated structured hypothesis assessment:\n" +
-					string(hypothesisJSON) +
-					"\nUse this assessment together with actual tool results. " +
-					"A supported hypothesis is not automatically a " +
-					"confirmed root cause.",
-			})
-		}
-
-		// 新证据可能改变检索方向，因此重新检索。
-		// 检索失败时保留上一轮知识，不能影响事故诊断主流程。
-		if r.knowledgeBase != nil && len(execution.Evidence) > 0 {
-			query := buildKnowledgeQuery(
-				incident,
-				evidenceStore.List(),
-				diagnosisManager.List(),
-			)
-
-			updatedKnowledge, searchErr := r.knowledgeBase.Search(
-				ctx,
-				query,
-				3,
-			)
-
-			if searchErr != nil {
 				fmt.Printf(
-					"[TraceMind] RAG refresh warning: %v\n",
-					searchErr,
+					"[TraceMind] hypothesis evaluation degraded (%v); keeping previous assessment\n",
+					err,
 				)
 			} else {
-				knowledge = updatedKnowledge
-				report.Knowledge = knowledge
+				report.DiagnosisHypotheses = diagnosisManager.List()
 
-				if len(knowledge) > 0 {
-					messages = append(messages, llm.Message{
-						Role:    "system",
-						Content: formatKnowledgeContext(knowledge),
-					})
+				hypothesisJSON, err := json.Marshal(
+					report.DiagnosisHypotheses,
+				)
+				if err != nil {
+					return fail(fmt.Errorf("marshal hypotheses: %w", err))
 				}
+
+				messages = append(messages, llm.Message{
+					Role: "system",
+					Content: "Updated structured hypothesis assessment:\n" +
+						string(hypothesisJSON) +
+						"\nUse this assessment together with actual tool results. " +
+						"A supported hypothesis is not automatically a " +
+						"confirmed root cause.",
+				})
 			}
+		}
+
+		// 新证据可能改变技能匹配方向，因此重新计算技能上下文。
+		// 技能库异常时保留上一轮知识，不能影响事故诊断主流程。
+		if r.skills != nil && loader != nil && len(execution.Evidence) > 0 {
+			skillMessage, refs, briefs := buildSkillContext(
+				r.skills,
+				buildKnowledgeQuery(
+					incident,
+					evidenceStore.List(),
+					diagnosisManager.List(),
+				),
+				loader,
+			)
+
+			if skillMessage != "" {
+				messages = append(messages, llm.Message{
+					Role:    "system",
+					Content: skillMessage,
+				})
+			}
+
+			skillRefs = mergeSkillRefs(skillRefs, refs)
+			skillBriefs = briefs
+			report.Knowledge = skillRefs
 		}
 
 		if err := transition(StateObserving); err != nil {
@@ -647,13 +716,33 @@ func applyFinalAnswer(report *Report, content string) error {
 		return errors.New("LLM returned an empty final answer")
 	}
 
+	// 容忍模型把 JSON 包在 Markdown 围栏里（```json ... ```）。
+	content = stripCodeFences(content)
+
 	var result struct {
 		Summary    string   `json:"summary"`
 		Hypotheses []string `json:"hypotheses"`
 	}
 
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
-		return fmt.Errorf("parse final diagnosis JSON: %w", err)
+		if repaired := repairJSON(content); repaired != content {
+			if repairErr := json.Unmarshal([]byte(repaired), &result); repairErr == nil {
+				// 修复成功，继续使用 result。
+			} else {
+				return fmt.Errorf(
+					"parse final diagnosis JSON: %v (repair also failed: %v); response=%q",
+					err,
+					repairErr,
+					truncateText(content, 500),
+				)
+			}
+		} else {
+			return fmt.Errorf(
+				"parse final diagnosis JSON: %w; response=%q",
+				err,
+				truncateText(content, 500),
+			)
+		}
 	}
 
 	result.Summary = strings.TrimSpace(result.Summary)
@@ -678,6 +767,22 @@ func applyFinalAnswer(report *Report, content string) error {
 	report.Summary = result.Summary
 	report.Hypotheses = result.Hypotheses
 	return nil
+}
+
+// stripCodeFences 去掉 ```json ... ``` 之类的 Markdown 围栏，只保留内部 JSON。
+func stripCodeFences(content string) string {
+	trimmed := strings.TrimSpace(content)
+	if !strings.HasPrefix(trimmed, "```") {
+		return trimmed
+	}
+
+	if idx := strings.Index(trimmed, "\n"); idx >= 0 {
+		trimmed = trimmed[idx+1:]
+	}
+	trimmed = strings.TrimSpace(trimmed)
+	trimmed = strings.TrimSuffix(trimmed, "```")
+
+	return strings.TrimSpace(trimmed)
 }
 
 // buildKnowledgeQuery 将事故描述、最新证据和候选假设组合为检索查询。
@@ -728,37 +833,4 @@ func buildKnowledgeQuery(
 	}
 
 	return strings.Join(parts, "\n")
-}
-
-func formatKnowledgeContext(documents []rag.Document) string {
-	if len(documents) == 0 {
-		return "No relevant reference knowledge was retrieved."
-	}
-
-	var builder strings.Builder
-
-	builder.WriteString(
-		"Reference knowledge retrieved from the local RAG knowledge base:\n",
-	)
-	builder.WriteString(
-		"These documents are reference material, NOT observations from the current incident.\n",
-	)
-	builder.WriteString(
-		"Use them to guide investigation and tool selection. " +
-			"Never treat them as proof of the current root cause.\n\n",
-	)
-
-	for i, doc := range documents {
-		fmt.Fprintf(
-			&builder,
-			"[Reference %d]\nSource: %s\nTitle: %s\nID: %s\nContent:\n%s\n\n",
-			i+1,
-			doc.Source,
-			doc.Title,
-			doc.ID,
-			doc.Content,
-		)
-	}
-
-	return builder.String()
 }

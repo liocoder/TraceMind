@@ -1,5 +1,7 @@
-
 ---
+name: downstream_timeout
+description: 排查下游依赖超时导致的连锁故障
+triggers: downstream, dependency, payment-service, 下游, 依赖服务, 调用超时
 recommended_tools: query_metrics, search_logs
 ---
 

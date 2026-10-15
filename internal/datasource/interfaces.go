@@ -61,7 +61,7 @@ type LogsProvider interface {
 	) ([]LogEntry, error)
 }
 
-// Provider combines the runbooks capabilities required by TraceMind.
+// Provider combines the datasource capabilities required by TraceMind.
 type Provider interface {
 	MetricsProvider
 	LogsProvider

@@ -21,7 +21,7 @@ func main() {
 	)
 	scenarioID := flag.String(
 		"scenario",
-		"default",
+		"connection_pool_exhaustion",
 		"Scenario ID in the mock observation dataset",
 	)
 	flag.Parse()
@@ -38,7 +38,7 @@ func main() {
 
 	provider, err := mock.NewProvider(*datasetPath, *scenarioID)
 	if err != nil {
-		log.Fatalf("initialize mock runbooks provider: %v", err)
+		log.Fatalf("initialize mock provider: %v", err)
 	}
 
 	registry := tool.NewRegistry()

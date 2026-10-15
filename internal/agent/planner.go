@@ -10,7 +10,6 @@ import (
 	"github.com/liocoder/TraceMind/internal/diagnosis"
 	"github.com/liocoder/TraceMind/internal/evidence"
 	"github.com/liocoder/TraceMind/internal/llm"
-	"github.com/liocoder/TraceMind/internal/rag"
 )
 
 var (
@@ -29,7 +28,7 @@ type PlanningInput struct {
 	Hypotheses    []diagnosis.Hypothesis
 	Tools         []ToolCandidate
 	ToolCallCount map[string]int
-	Knowledge     []rag.Document
+	Knowledge     []SkillBrief
 }
 
 type InvestigationPlan struct {
@@ -37,6 +36,19 @@ type InvestigationPlan struct {
 	Rationale           string `json:"rationale"`
 	TargetHypothesisID  string `json:"target_hypothesis_id,omitempty"`
 	ExpectedObservation string `json:"expected_observation"`
+}
+
+// ErrPlannerDegraded 表示规划器因模型输出或 LLM API 异常而无法给出可用计划。
+// 与配置类错误不同，它不应终止整个调查，而应触发优雅终局（forceFinal）。
+var ErrPlannerDegraded = errors.New("planner degraded")
+
+// plannerDegraded 包装模型输出类错误，使 runtime 可用 errors.Is 识别，
+// 同时保留底层错误链。cause 为 nil 时只包装 ErrPlannerDegraded。
+func plannerDegraded(cause error, format string, args ...any) error {
+	if cause == nil {
+		return fmt.Errorf(format+": %w", append(args, ErrPlannerDegraded)...)
+	}
+	return fmt.Errorf(format+": %w: %w", append(args, cause, ErrPlannerDegraded)...)
 }
 
 type Planner interface {
@@ -128,7 +140,7 @@ func (p *LLMPlanner) PlanContext(
 		Hypotheses    []diagnosis.Hypothesis  `json:"hypotheses"`
 		Tools         []ToolCandidate         `json:"available_tools"`
 		ToolCallCount map[string]int          `json:"tool_call_count"`
-		Knowledge     []plannerKnowledgeBrief `json:"reference_knowledge,omitempty"`
+		Knowledge     []plannerKnowledgeBrief `json:"skill_knowledge,omitempty"`
 	}{
 		Incident:      input.Incident,
 		Evidence:      input.Evidence,
@@ -137,13 +149,17 @@ func (p *LLMPlanner) PlanContext(
 		ToolCallCount: input.ToolCallCount,
 	}
 
-	for _, doc := range input.Knowledge {
+	for _, brief := range input.Knowledge {
+		content := brief.Description
+		if brief.Content != "" {
+			content = brief.Content
+		}
+
 		payload.Knowledge = append(payload.Knowledge, plannerKnowledgeBrief{
-			ID:               doc.ID,
-			Title:            doc.Title,
-			Source:           doc.Source,
-			Content:          truncateText(doc.Content, 2500),
-			RecommendedTools: doc.RecommendedTools,
+			Name:             brief.Name,
+			Level:            brief.Level,
+			Content:          truncateText(content, 2500),
+			RecommendedTools: brief.RecommendedTools,
 		})
 	}
 
@@ -156,12 +172,12 @@ func (p *LLMPlanner) PlanContext(
 
 Choose exactly ONE useful next investigation tool, or return NO_ACTION when further investigation is not useful.
 
-You receive the incident description, observations collected from tools, current hypotheses, available tools, tool-call counts, and optional runbook knowledge.
+You receive the incident description, observations collected from tools, current hypotheses, available tools, tool-call counts, and optional skill knowledge.
 
 Rules:
 1. Choose based on the incident, actual observations, and unresolved uncertainties.
-2. Do not assume a root cause merely because it is mentioned in the incident or runbook.
-3. Runbook knowledge is guidance, not evidence from the current incident.
+2. Do not assume a root cause merely because it is mentioned in the incident or a skill.
+3. Skill knowledge is guidance, not evidence from the current incident.
 4. Prefer a tool that distinguishes competing hypotheses or verifies a prediction.
 5. Avoid repeating a query that has already provided sufficient information.
 6. Select only an exact tool name from available_tools.
@@ -193,15 +209,24 @@ For no further action, return:
 		{Role: "user", Content: string(inputJSON)},
 	}, nil)
 	if err != nil {
-		return InvestigationPlan{}, fmt.Errorf("LLM planning request: %w", err)
+		return InvestigationPlan{}, plannerDegraded(
+			err,
+			"LLM planning request",
+		)
 	}
 	if completion == nil {
-		return InvestigationPlan{}, errors.New("LLM planner returned nil completion")
+		return InvestigationPlan{}, plannerDegraded(
+			nil,
+			"LLM planner returned nil completion",
+		)
 	}
 
 	content := strings.TrimSpace(completion.Message.Content)
 	if content == "" {
-		return InvestigationPlan{}, errors.New("LLM planner returned empty content")
+		return InvestigationPlan{}, plannerDegraded(
+			nil,
+			"LLM planner returned empty content",
+		)
 	}
 
 	var result struct {
@@ -213,11 +238,23 @@ For no further action, return:
 	}
 
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
-		return InvestigationPlan{}, fmt.Errorf(
-			"decode LLM planning response: %w; response=%q",
-			err,
-			truncateText(content, 500),
-		)
+		if repaired := repairJSON(content); repaired != content {
+			if repairErr := json.Unmarshal([]byte(repaired), &result); repairErr == nil {
+				// 修复成功，继续使用 result。
+			} else {
+				return InvestigationPlan{}, plannerDegraded(
+					repairErr,
+					"decode LLM planning response (repair failed); response=%q",
+					truncateText(content, 500),
+				)
+			}
+		} else {
+			return InvestigationPlan{}, plannerDegraded(
+				err,
+				"decode LLM planning response; response=%q",
+				truncateText(content, 500),
+			)
+		}
 	}
 
 	switch strings.ToUpper(strings.TrimSpace(result.Action)) {
@@ -226,7 +263,8 @@ For no further action, return:
 	case "CALL_TOOL":
 		// 继续校验工具名及计划内容。
 	default:
-		return InvestigationPlan{}, fmt.Errorf(
+		return InvestigationPlan{}, plannerDegraded(
+			nil,
 			"LLM planner returned unsupported action %q",
 			result.Action,
 		)
@@ -234,7 +272,8 @@ For no further action, return:
 
 	result.ToolName = strings.TrimSpace(result.ToolName)
 	if _, ok := available[result.ToolName]; !ok {
-		return InvestigationPlan{}, fmt.Errorf(
+		return InvestigationPlan{}, plannerDegraded(
+			nil,
 			"LLM planner selected unavailable tool %q",
 			result.ToolName,
 		)
@@ -245,10 +284,16 @@ For no further action, return:
 	result.TargetHypothesisID = strings.TrimSpace(result.TargetHypothesisID)
 
 	if result.Rationale == "" {
-		return InvestigationPlan{}, errors.New("LLM planner returned empty rationale")
+		return InvestigationPlan{}, plannerDegraded(
+			nil,
+			"LLM planner returned empty rationale",
+		)
 	}
 	if result.ExpectedObservation == "" {
-		return InvestigationPlan{}, errors.New("LLM planner returned empty expected_observation")
+		return InvestigationPlan{}, plannerDegraded(
+			nil,
+			"LLM planner returned empty expected_observation",
+		)
 	}
 
 	if result.TargetHypothesisID != "" {
@@ -260,7 +305,8 @@ For no further action, return:
 			}
 		}
 		if !found {
-			return InvestigationPlan{}, fmt.Errorf(
+			return InvestigationPlan{}, plannerDegraded(
+				nil,
 				"LLM planner referenced unknown hypothesis ID %q",
 				result.TargetHypothesisID,
 			)
@@ -276,9 +322,8 @@ For no further action, return:
 }
 
 type plannerKnowledgeBrief struct {
-	ID               string   `json:"id"`
-	Title            string   `json:"title"`
-	Source           string   `json:"source"`
+	Name             string   `json:"name"`
+	Level            string   `json:"level"`
 	Content          string   `json:"content"`
 	RecommendedTools []string `json:"recommended_tools,omitempty"`
 }

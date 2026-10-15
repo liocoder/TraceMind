@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -139,8 +140,42 @@ func (c *Client) ChatWithTools(
 	}, tools)
 }
 
+// retryMaxAttempts 是瞬态 API 失败的额外重试次数（不含首次尝试）。
+const retryMaxAttempts = 2
+
+// retryBaseDelay 是重试退避的基础延迟；第 n 次重试延迟为 base * 2^(n-1)。
+const retryBaseDelay = 500 * time.Millisecond
+
+// apiError 携带 HTTP 状态码，便于区分可重试的瞬态错误与确定性错误。
+type apiError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *apiError) Error() string {
+	return fmt.Sprintf("model API returned HTTP %d: %s", e.StatusCode, e.Body)
+}
+
+func (e *apiError) retryable() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
+// transportError 标记网络传输层的失败（连接失败、超时等），视为可重试。
+type transportError struct {
+	err error
+}
+
+func (e *transportError) Error() string {
+	return e.err.Error()
+}
+
+func (e *transportError) Unwrap() error {
+	return e.err
+}
+
 // Complete 发送完整消息历史，可选附带工具定义。
 // 后续 Agent Runtime 可以用它连续发送 assistant、tool 等消息。
+// 对 429、5xx 与网络类瞬态错误做带退避的重试；认证错误、4xx 与解析错误不重试。
 func (c *Client) Complete(
 	ctx context.Context,
 	messages []Message,
@@ -150,6 +185,56 @@ func (c *Client) Complete(
 		return nil, fmt.Errorf("messages cannot be empty")
 	}
 
+	var lastErr error
+
+	for attempt := 0; attempt <= retryMaxAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(retryBaseDelay * time.Duration(1<<(attempt-1))):
+			}
+		}
+
+		completion, err := c.completeOnce(ctx, messages, tools)
+		if err == nil {
+			return completion, nil
+		}
+
+		lastErr = err
+		if !isRetryableError(err) {
+			break
+		}
+
+		if attempt < retryMaxAttempts {
+			fmt.Printf(
+				"[llm] transient failure on attempt %d (%v); retrying\n",
+				attempt+1,
+				err,
+			)
+		}
+	}
+
+	return nil, lastErr
+}
+
+// isRetryableError 判断错误是否为可重试的瞬态错误。
+func isRetryableError(err error) bool {
+	var apiErr *apiError
+	if errors.As(err, &apiErr) {
+		return apiErr.retryable()
+	}
+
+	var transportErr *transportError
+	return errors.As(err, &transportErr)
+}
+
+// completeOnce 执行一次模型请求，不做重试。
+func (c *Client) completeOnce(
+	ctx context.Context,
+	messages []Message,
+	tools []ToolDefinition,
+) (*Completion, error) {
 	payload := chatRequest{
 		Model:    c.model,
 		Messages: messages,
@@ -176,7 +261,9 @@ func (c *Client) Complete(
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("call model API: %w", err)
+		return nil, &transportError{
+			err: fmt.Errorf("call model API: %w", err),
+		}
 	}
 	defer resp.Body.Close()
 
@@ -186,11 +273,10 @@ func (c *Client) Complete(
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf(
-			"model API returned HTTP %d: %s",
-			resp.StatusCode,
-			string(respBody),
-		)
+		return nil, &apiError{
+			StatusCode: resp.StatusCode,
+			Body:       string(respBody),
+		}
 	}
 
 	var result chatResponse

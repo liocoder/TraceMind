@@ -26,6 +26,9 @@ type LLMConfig struct {
 type AgentConfig struct {
 	MaxToolCalls   int `yaml:"max_tool_calls"`
 	TimeoutSeconds int `yaml:"timeout_seconds"`
+	// MaxTokens 是单次事件调查的估算 token 硬上限。
+	// 小于等于 0 表示不启用 token 预算。
+	MaxTokens int `yaml:"max_tokens"`
 }
 
 // localConfig 只用于读取本地敏感配置，不应提交到 Git。

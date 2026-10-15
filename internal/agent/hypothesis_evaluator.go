@@ -124,7 +124,7 @@ Evidence discipline:
 16. Return an empty hypotheses array if no defensible hypothesis can be formed.
 17. Do not use Markdown code fences.
 
-Input runbooks:
+Input context:
 ` + string(payload)
 
 	completion, err := client.Complete(
@@ -146,7 +146,24 @@ Input runbooks:
 
 	var response hypothesisEvaluationResponse
 	if err := json.Unmarshal([]byte(content), &response); err != nil {
-		return fmt.Errorf("parse hypothesis evaluation JSON: %w", err)
+		if repaired := repairJSON(content); repaired != content {
+			if repairErr := json.Unmarshal([]byte(repaired), &response); repairErr == nil {
+				// 修复成功，继续使用 response。
+			} else {
+				return fmt.Errorf(
+					"parse hypothesis evaluation JSON: %v (repair also failed: %v); response=%q",
+					err,
+					repairErr,
+					truncateText(content, 500),
+				)
+			}
+		} else {
+			return fmt.Errorf(
+				"parse hypothesis evaluation JSON: %w; response=%q",
+				err,
+				truncateText(content, 500),
+			)
+		}
 	}
 
 	existingByID := make(map[string]diagnosis.Hypothesis, len(existing))

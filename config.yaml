@@ -7,3 +7,5 @@ llm:
 agent:
   max_tool_calls: 3
   timeout_seconds: 60
+  # 单次事件调查的估算 token 硬上限；<=0 表示不启用 token 预算。
+  max_tokens: 0

@@ -43,6 +43,19 @@ func (r *Registry) ToLLMDefinitions() ([]llm.ToolDefinition, error) {
 				"additionalProperties": false,
 			}
 
+		case "load_skill":
+			parameters = map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"name": map[string]any{
+						"type":        "string",
+						"description": "Name of the investigation skill to load in full",
+					},
+				},
+				"required":             []string{"name"},
+				"additionalProperties": false,
+			}
+
 		default:
 			return nil, fmt.Errorf(
 				"missing LLM parameter schema for tool %q",

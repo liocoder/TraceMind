@@ -1,5 +1,8 @@
-
-$ErrorActionPreference = "Stop"
+﻿
+# 不能设为 Stop：go run 的 stderr（如 Partial report、警告）经 2>&1 捕获后会变成
+# 终止性错误记录，导致脚本中断且不写日志。Continue 下脚本会继续跑完所有 case，
+# 文件缺失等真实问题仍由显式 throw 处理。
+$ErrorActionPreference = "Continue"
 
 # Always run from the repository root.
 $repoRoot = Split-Path -Parent $PSScriptRoot
@@ -32,6 +35,8 @@ foreach ($case in $caseData.cases) {
     Write-Host "=================================================="
 
     # Run the existing TraceMind command with this scenario.
+    # 先清零上次的退出码，避免 go 启动失败时误用陈旧值。
+    $LASTEXITCODE = 0
     $output = @(
         & go run ./cmd/agent `
             -config config.yaml `

@@ -1,6 +1,8 @@
-
 ---
-recommended_tools: inspect_database, query_metrics, search_logs
+name: database_latency
+description: 排查数据库延迟升高、慢查询与连接异常
+triggers: database, slow query, query latency, 数据库, 慢查询, 查询延迟, 锁等待
+recommended_tools: query_metrics, search_logs
 ---
 
 # 数据库延迟升高与查询异常
