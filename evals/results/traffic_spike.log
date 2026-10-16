@@ -6,7 +6,7 @@ Mock scenario: traffic_spike
 [TraceMind] result=service=api-gateway, timestamp=2026-10-15T10:50:00Z, status=degraded, baseline_request_rate=3000requests/s, error_rate=9%, p95_latency_ms=2100ms, request_rate=12000requests/s
 [TraceMind] tool=query_metrics arguments={"service": "order-service"}
 [TraceMind] result=service=order-service, timestamp=2026-10-15T10:50:00Z, status=degraded, connection_pool_usage=92%, cpu_usage=78%, error_rate=8%
-[TraceMind] tool=search_logs arguments={"query": "order-service connection pool exhaustion timeout error gateway degraded 10:50"}
+[TraceMind] tool=search_logs arguments={"query": "api-gateway order-service error timeout connection pool acquisition failure"}
 [TraceMind] result=2026-10-15T10:50:01Z WARN service=api-gateway request rate increased to four times baseline
 2026-10-15T10:50:02Z ERROR service=order-service request rejected after connection pool reached capacity
 {
@@ -27,142 +27,170 @@ Mock scenario: traffic_spike
     "completed"
   ],
   "tool_calls": 3,
-  "summary": "The API gateway and order service are both degraded at 2026-10-15T10:50:00Z. Observed evidence shows a request surge at the gateway (12000 req/s vs 3000 req/s baseline, 9% error rate, 2100ms p95) coinciding with order-service resource saturation (connection_pool_usage 92%, cpu_usage 78%, 8% error rate) and explicit order-service log errors rejecting requests after the connection pool reached capacity. The most consistent causal chain is that the gateway request surge drove load to the order service, whose connection pool reached capacity and rejected requests, producing errors and backpressure that degraded both services. The direction of causation is supported by the gateway log recording the request rate increase and the order-service pool reaching capacity, but it is not definitively confirmed without tracing/capacity limits.",
+  "summary": "Both api-gateway and order-service were in a degraded state at the same timestamp (2026-10-15T10:50Z). The gateway received 12000 requests/s against a 3000 requests/s baseline (a ~4x surge), with 9% errors and p95 latency of 2100 ms. The order service showed 92% connection_pool_usage, 78% CPU, and 8% errors. Logs confirm the gateway observed the fourfold request-rate increase and the order service rejected requests after its connection pool reached capacity. The most consistent explanation is that a traffic surge hit the gateway and forwarded load to the order service, whose connection pool saturated, causing rejections and elevated latency that surfaced as gateway errors. However, no evidence directly establishes the gateway-to-order-service call path or confirms the causal direction; this remains a strong hypothesis rather than a confirmed root cause.",
   "hypotheses": [
-    "Gateway request surge (4x baseline) overloaded the order service downstream, whose connection pool reached capacity and began rejecting requests, degrading both services.",
-    "The order service connection pool independently became exhausted (e.g., slow queries or connection leak), and its failures propagated back to the gateway as latency and errors.",
-    "The API gateway itself saturated under load independently, with the order-service connection pool exhaustion being a co-occurring symptom of the same load surge."
+    "A traffic surge (~4x baseline) drove the API gateway to degrade, and forwarded load saturated the order service connection pool, producing cascading latency and errors.",
+    "The order service connection pool exhaustion is the primary fault, and gateway degradation is a downstream symptom of order-service failures.",
+    "The gateway load surge and order-service saturation are independent or share an external cause (e.g., a broader traffic event) rather than one causing the other."
   ],
   "evidence": [
     {
       "id": "ev-001",
       "source": "metrics-provider",
       "content": "service=api-gateway, timestamp=2026-10-15T10:50:00Z, status=degraded, baseline_request_rate=3000requests/s, error_rate=9%, p95_latency_ms=2100ms, request_rate=12000requests/s",
-      "created_at": "2026-10-16T05:29:17.3988887Z"
+      "created_at": "2026-10-16T12:09:17.1933175Z"
     },
     {
       "id": "ev-002",
       "source": "metrics-provider",
       "content": "service=order-service, timestamp=2026-10-15T10:50:00Z, status=degraded, connection_pool_usage=92%, cpu_usage=78%, error_rate=8%",
-      "created_at": "2026-10-16T05:29:22.9562819Z"
+      "created_at": "2026-10-16T12:09:23.0641088Z"
     },
     {
       "id": "ev-003",
       "source": "logs-provider",
       "content": "2026-10-15T10:50:01Z WARN service=api-gateway request rate increased to four times baseline\n2026-10-15T10:50:02Z ERROR service=order-service request rejected after connection pool reached capacity",
-      "created_at": "2026-10-16T05:29:29.5331987Z"
+      "created_at": "2026-10-16T12:09:29.6604778Z"
     }
   ],
   "plans": [
     {
       "tool_name": "query_metrics",
-      "rationale": "No observations have been collected yet. Querying metrics for the degraded API gateway and order service will establish baseline health data and reveal which service shows anomalies first, helping localize the failure.",
-      "expected_observation": "Error rates, latency, throughput, or resource saturation anomalies on the API gateway and order service."
+      "rationale": "No observations have been collected yet. Querying metrics for the degraded API gateway is the fastest way to establish when degradation started, its severity, and whether it correlates with downstream order service behavior.",
+      "expected_observation": "Latency, error rate, and resource saturation metrics for the API gateway that indicate the onset and nature of the degradation."
     },
     {
       "tool_name": "query_metrics",
-      "rationale": "Evidence currently only covers the API gateway. Querying the order service's metrics is the most direct way to test hyp-6c1e9d04 (order service degradation propagating to the gateway) versus hyp-3f7a2b91 (independent gateway overload), because a degraded order service would indicate a downstream cause while normal order metrics with a sustained gateway surge would favor gateway overload.",
-      "target_hypothesis_id": "hyp-6c1e9d04",
-      "expected_observation": "Order service health metrics showing whether it is degraded (elevated errors/latency, reduced throughput) or healthy, to establish whether gateway degradation likely originates downstream or from gateway-side load."
+      "rationale": "Hypothesis hyp-9b2d4e60 is inconclusive because only api-gateway metrics have been inspected. Querying the order service metrics will clarify whether the order service is independently saturated (supporting an independent/downstream failure) or whether its behavior aligns with propagating pressure from the gateway or an upstream dependency.",
+      "target_hypothesis_id": "hyp-9b2d4e60",
+      "expected_observation": "Order service metrics such as error_rate, p95_latency_ms, request_rate, and any dependency saturation indicators, to determine direction and mechanism of degradation."
     },
     {
       "tool_name": "search_logs",
-      "rationale": "The two competing hypotheses are gateway overload versus order-service resource saturation propagating upstream. Logs from the order service and gateway around 2026-10-15T10:50:00Z are the most direct way to distinguish them, revealing connection-pool acquisition failures, timeouts, or downstream error messages that indicate the causal direction and mechanism.",
-      "target_hypothesis_id": "hyp-6c1e9d04",
-      "expected_observation": "Log entries from order-service showing connection pool exhaustion/timeout errors or upstream dependency failures, and gateway logs referencing order-service errors, which would indicate whether order-service degradation is the source and how it propagates to the gateway."
+      "rationale": "Metrics show degradation in both services but cannot establish dependency direction or the failure mechanism. Searching logs for errors, timeouts, and connection acquisition failures can distinguish among the competing hypotheses: gateway load surge, order-service connection-pool exhaustion, and downstream propagation between the two services.",
+      "target_hypothesis_id": "hyp-9b2d4e60",
+      "expected_observation": "Log entries revealing whether the gateway errors reference the order service (supporting downstream propagation), whether order-service logs show connection acquisition timeouts or pool exhaustion (supporting resource saturation), or whether both services show signs of a shared external cause."
     }
   ],
   "diagnosis_hypotheses": [
     {
-      "id": "hyp-3f7a2b91",
-      "title": "API gateway overloaded by request surge",
-      "description": "The API gateway is degraded concurrent with a request rate (12000 requests/s) that is four times its baseline (3000 requests/s), with elevated error rate (9%) and p95 latency (2100ms). Gateway logs also explicitly note the request rate increased to four times baseline. This pattern is consistent with gateway saturation, where high load may cause request queuing or resource contention and lead to degraded responses. The evidence does not establish the underlying mechanism (e.g., capacity limit, resource exhaustion) or confirm that the request surge is itself the root cause rather than a symptom of an upstream issue or downstream backpressure.",
+      "id": "hyp-3f7a1c2e",
+      "title": "Gateway request-rate surge drives degradation",
+      "description": "The API gateway is degraded while receiving roughly four times its baseline request rate (12000 requests/s vs. 3000 requests/s baseline), with an elevated error rate (9%) and p95 latency of 2100 ms. A load surge beyond designed or provisioned capacity remains a plausible driver of the observed gateway degradation, and the gateway log explicitly notes the request rate increased to four times baseline. However, the available evidence does not establish the mechanism (e.g., queueing, resource saturation, or upstream dependency pressure), nor does it establish causation for the order service degradation, which could instead be a downstream or independent effect.",
       "status": "proposed",
       "confidence": 0.45,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "supports",
-          "reason": "This evidence directly shows the api-gateway is degraded while its request rate is 12000 requests/s versus a 3000 requests/s baseline, with an elevated error rate of 9% and p95 latency of 2100ms, which is consistent with load-driven saturation."
+          "reason": "Shows the api-gateway in degraded state with request_rate=12000requests/s against a baseline of 3000requests/s (a ~4x increase), plus error_rate=9% and p95_latency_ms=2100ms, which is consistent with a significant load surge accompanying the degradation."
         },
         {
           "evidence_id": "ev-003",
           "relation": "supports",
-          "reason": "This log entry directly records that the api-gateway request rate increased to four times baseline, corroborating the request surge described in ev-001 and supporting a load-related hypothesis."
+          "reason": "The api-gateway log explicitly warns that request rate increased to four times baseline, directly corroborating the load surge reported in ev-001."
         }
       ]
     },
     {
-      "id": "hyp-6c1e9d04",
-      "title": "Order service degradation propagating to API gateway",
-      "description": "The incident states both the API gateway and order service are degraded. If the order service is downstream of the API gateway, degraded order service responses could increase API gateway latency and errors, making the gateway metrics (9% error rate, 2100ms p95) a downstream symptom of order service problems rather than an independent gateway overload. Order service metrics show elevated connection pool usage (92%), CPU usage (78%), and an 8% error rate at the same timestamp, consistent with order service stress. The causal direction between the two services is still not established by tracing or other evidence.",
+      "id": "hyp-4d6e1a93",
+      "title": "Gateway-to-order-service call chain bottleneck under load",
+      "description": "The gateway log records a fourfold request-rate increase, and the order-service log immediately afterward records request rejections after its connection pool reached capacity. If gateway traffic is forwarded to the order service, the load surge could be driving order-service connection-pool saturation, whose rejections and elevated response times then surface as gateway latency and errors. The near-simultaneous timestamps (10:50:01Z and 10:50:02Z) are consistent with this sequence, but no evidence establishes the gateway-to-order-service call path, and the observed correlation alone does not prove the direction of causation.",
       "status": "proposed",
-      "confidence": 0.34,
+      "confidence": 0.3,
+      "evidence": [
+        {
+          "evidence_id": "ev-001",
+          "relation": "supports",
+          "reason": "Documents the gateway receiving 12000requests/s against a 3000requests/s baseline while degraded, providing the load-surge condition that could be forwarded downstream."
+        },
+        {
+          "evidence_id": "ev-002",
+          "relation": "supports",
+          "reason": "Shows the order service degraded with connection_pool_usage=92% and error_rate=8%, consistent with it being the stressed downstream component in such a chain."
+        },
+        {
+          "evidence_id": "ev-003",
+          "relation": "supports",
+          "reason": "Shows a gateway log at 10:50:01Z about request rate increasing to four times baseline immediately followed at 10:50:02Z by an order-service log about request rejection after the connection pool reached capacity, a temporal sequence consistent with load passing from the gateway to the order service."
+        }
+      ]
+    },
+    {
+      "id": "hyp-5c8a2f41",
+      "title": "Order service resource saturation contributes to degradation",
+      "description": "The order service is degraded with connection_pool_usage=92% and cpu_usage=78%, both elevated though not necessarily exhausted. These utilization levels are consistent with growing resource pressure on the order service, which could contribute to its 8% error rate, and the order-service log recording requests rejected after the connection pool reached capacity is consistent with connection-pool pressure being a factor. The evidence still does not prove that the CPU utilization is causing degradation or identify the resource behind connection_pool_usage beyond the order service's own pool, so the mechanism remains partly speculative.",
+      "status": "supported",
+      "confidence": 0.5,
+      "evidence": [
+        {
+          "evidence_id": "ev-002",
+          "relation": "supports",
+          "reason": "Shows order-service degraded with connection_pool_usage=92% and cpu_usage=78% alongside error_rate=8%, which is consistent with elevated resource utilization coinciding with degradation."
+        },
+        {
+          "evidence_id": "ev-003",
+          "relation": "supports",
+          "reason": "The order-service log states requests were rejected after the connection pool reached capacity, directly tying order-service request rejections to connection-pool capacity being reached."
+        }
+      ]
+    },
+    {
+      "id": "hyp-9b2d4e60",
+      "title": "Order service degradation propagates to the gateway",
+      "description": "The gateway's elevated latency (p95 2100 ms) and 9% error rate could be a downstream symptom of degradation in the order service rather than an intrinsic gateway problem, if the gateway synchronously depends on the order service. Evidence includes order-service degradation with connection_pool_usage=92%, cpu_usage=78%, error_rate=8%, and rejected requests after the connection pool reached capacity. However, no evidence establishes a call dependency or the direction of causality between the two degraded services; the degradation could also flow from the gateway to the order service or arise from a shared cause. This remains unverified.",
+      "status": "proposed",
+      "confidence": 0.3,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "neutral",
-          "reason": "This evidence shows the api-gateway is degraded with elevated errors and latency, but it contains no order service data, so it does not directly support or refute order service involvement."
+          "reason": "Documents gateway-side latency (p95 2100ms) and error_rate=9% degradation, which is consistent with an upstream dependency problem but does not reference the order service or any call dependency, so it neither confirms nor rules out downstream propagation from the order service."
         },
         {
           "evidence_id": "ev-002",
           "relation": "supports",
-          "reason": "This evidence shows the order-service is concurrently degraded with elevated connection pool usage (92%), CPU usage (78%), and an 8% error rate at the same timestamp as the gateway degradation, which is consistent with order service stress that could contribute to gateway symptoms, though causality is not proven."
-        },
-        {
-          "evidence_id": "ev-003",
-          "relation": "neutral",
-          "reason": "This evidence includes an order-service error that requests were rejected after a connection pool reached capacity, which is consistent with order service stress but does not by itself establish that order service degradation propagated to the api-gateway."
-        }
-      ]
-    },
-    {
-      "id": "hyp-9b2d4f81",
-      "title": "Order service resource saturation contributing to degradation",
-      "description": "The order service is degraded with connection_pool_usage at 92% and CPU usage at 78%, alongside an 8% error rate at 2026-10-15T10:50:00Z. Order service logs explicitly record requests being rejected after the connection pool reached capacity. High utilization of an unspecified connection pool and elevated CPU are consistent with resource contention or saturation within the order service, which could reduce its responsiveness and contribute to its degraded status. The evidence does not prove this is the root cause of the broader incident rather than a co-occurring symptom.",
-      "status": "proposed",
-      "confidence": 0.4,
-      "evidence": [
-        {
-          "evidence_id": "ev-002",
-          "relation": "supports",
-          "reason": "This evidence directly shows the order-service is degraded with connection_pool_usage=92%, cpu_usage=78%, and error_rate=8%, which is consistent with resource saturation or contention within the order service."
+          "reason": "Shows the order-service itself in degraded state with elevated error_rate=8%, connection_pool_usage=92%, and cpu_usage=78%, indicating the order service has its own stress consistent with it being a source of upstream impact."
         },
         {
           "evidence_id": "ev-003",
           "relation": "supports",
-          "reason": "This log entry directly shows an order-service request being rejected after the connection pool reached capacity, which supports a connection pool capacity concern in the order service."
+          "reason": "Records order-service request rejections after the connection pool reached capacity, showing the order service is actively failing requests, which is consistent with it being a source of upstream impact."
         }
       ]
     }
   ],
   "observed_facts": [
-    "api-gateway at 2026-10-15T10:50:00Z: status=degraded, request_rate=12000 req/s vs baseline_request_rate=3000 req/s, error_rate=9%, p95_latency_ms=2100ms.",
-    "order-service at 2026-10-15T10:50:00Z: status=degraded, connection_pool_usage=92%, cpu_usage=78%, error_rate=8%.",
-    "api-gateway log at 2026-10-15T10:50:01Z: WARN request rate increased to four times baseline.",
-    "order-service log at 2026-10-15T10:50:02Z: ERROR request rejected after connection pool reached capacity."
+    "api-gateway status=degraded at 2026-10-15T10:50:00Z with request_rate=12000 requests/s vs baseline_request_rate=3000 requests/s, error_rate=9%, p95_latency_ms=2100ms.",
+    "order-service status=degraded at 2026-10-15T10:50:00Z with connection_pool_usage=92%, cpu_usage=78%, error_rate=8%.",
+    "api-gateway log at 2026-10-15T10:50:01Z warned that request rate increased to four times baseline.",
+    "order-service log at 2026-10-15T10:50:02Z recorded request rejected after connection pool reached capacity."
   ],
   "supporting_evidence": [
-    "Order-service log explicitly records requests rejected after the connection pool reached capacity, matching connection_pool_usage=92% and error_rate=8%.",
-    "Timeline ordering: gateway request-rate warning at 10:50:01Z precedes order-service pool-capacity rejection at 10:50:02Z, consistent with load from the gateway surge reaching the order service.",
-    "The order-service pool saturation and gateway error/latency elevation occur at the same timestamp, consistent with a shared load-driven chain."
+    "The gateway metrics and log both independently show a ~4x request-rate surge coinciding with degradation.",
+    "The order service shows 92% connection pool usage and a log confirming requests were rejected because the connection pool reached capacity.",
+    "The temporal sequence (gateway surge logged at 10:50:01Z, order-service pool-capacity rejection at 10:50:02Z) is consistent with load passing from the gateway to the order service.",
+    "The near-simultaneous degradation timestamps of both services are consistent with a coupled failure chain."
   ],
   "refuting_evidence": [
-    "No tracing data confirms that gateway traffic is the source of the order-service load or that order-service failures are the direct cause of gateway errors.",
-    "The gateway error rate (9%) is slightly higher than the order-service error rate (8%), and the gateway request rate surge could be an independent saturation event; neither alternative is excluded."
+    "No tool result explicitly confirms a gateway-to-order-service call dependency or that gateway traffic is forwarded to the order service.",
+    "The order service also shows elevated CPU (78%), which could indicate an independent resource problem rather than purely gateway-induced load.",
+    "No evidence rules out a shared external cause driving both services simultaneously."
   ],
   "unverified_issues": [
-    "The direction of causation between the gateway request surge and order-service connection pool exhaustion is inferred from ordering and co-occurrence, not from end-to-end tracing.",
-    "The connection pool's total capacity, checkout timeout configuration, and whether the pool is exhausted by demand volume versus slow queries/connection leak are unknown.",
-    "Whether there is an upstream source driving the 4x request surge to the gateway is unknown.",
-    "Any other downstream dependencies of the order service (e.g., a database) were not investigated and could contribute to latency or pool holding."
+    "The direction of causality between gateway and order-service degradation is not directly established.",
+    "Whether the order service is a synchronous downstream dependency of the gateway (call path) is unconfirmed.",
+    "The resource type behind connection_pool_usage=92% (which downstream datastore or pool) is not identified.",
+    "Whether the 4x traffic surge is legitimate load or an anomalous event (e.g., retry storm, attack) is unknown.",
+    "Whether CPU at 78% is contributing to order-service errors is not established."
   ],
   "confidence": "medium",
   "next_steps": [
-    "Obtain distributed trace data linking gateway requests to order-service calls during the surge window to confirm causal direction.",
-    "Inspect connection pool capacity, active connections, checkout timeout, and wait-time metrics for the order service.",
-    "Check the order service's database (or downstream dependency) latency and slow-query metrics to determine whether pool connections are held by slow operations.",
-    "Identify the source of the 4x request surge to the gateway to determine whether it is the trigger."
+    "Inspect gateway routing/config to confirm it forwards requests to order-service (establish the call path).",
+    "Examine trace/call-chain data linking gateway requests to order-service connection-pool acquisitions to confirm propagation direction.",
+    "Identify the specific downstream resource behind the order-service connection pool and query its utilization to confirm pool exhaustion.",
+    "Compare metric time series before and after onset to determine whether gateway latency rose before or after order-service pool saturation.",
+    "Determine the source of the 4x traffic surge to assess whether it is legitimate load or an anomalous retry storm."
   ],
   "knowledge": [
     {

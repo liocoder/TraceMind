@@ -4,10 +4,10 @@ Mock scenario: insufficient_evidence
 
 [TraceMind] tool=query_metrics arguments={"service": "order-service"}
 [TraceMind] result=service=order-service, timestamp=2026-10-15T11:20:00Z, status=healthy, connection_pool_usage=40%, cpu_usage=35%, error_rate=1%, p95_latency_ms=300ms
-[TraceMind] tool=query_metrics arguments={"service": "order-service"}
-[TraceMind] result=service=order-service, timestamp=2026-10-15T11:20:00Z, status=healthy, connection_pool_usage=40%, cpu_usage=35%, error_rate=1%, p95_latency_ms=300ms
-[TraceMind] tool=search_logs arguments={"query": "order-service latency timeout slow query connection pool"}
+[TraceMind] tool=search_logs arguments={"query": "order-service latency timeout connection pool downstream dependency"}
 [TraceMind] result=2026-10-15T11:20:01Z WARN service=order-service intermittent request latency reported without additional diagnostic details
+[TraceMind] tool=search_logs arguments={"query": "timeout connection acquisition failure downstream error retry spike"}
+[TraceMind] result=No matching logs found.
 {
   "incident": "The order service reportedly has intermittent latency. Investigate the root cause.",
   "state": "completed",
@@ -26,119 +26,125 @@ Mock scenario: insufficient_evidence
     "completed"
   ],
   "tool_calls": 3,
-  "summary": "The reported intermittent latency in order-service is not reproducible from the available evidence. The single distinct metric sample (2026-10-15T11:20:00Z) shows a healthy service: p95_latency_ms=300ms, error_rate=1%, cpu_usage=35%, and connection_pool_usage=40%, none of which indicate saturation. The only corroborating log entry is a WARN at 11:20:01Z stating that intermittent request latency was reported 'without additional diagnostic details.' No slow-query, timeout, retry, or connection-acquisition errors were found. Because the observation set is limited to one distinct (duplicated) timestamp with no anomaly captured, no root-cause mechanism can be established. The intermittency may be real but unsampled/transient, or the report may lack diagnostic basis. The leading conclusion is uncertainty: the root cause cannot be determined from current evidence.",
+  "summary": "The order service is reported to have intermittent latency, but the available telemetry does not capture the degraded condition. A metrics snapshot at 2026-10-15T11:20:00Z shows the service healthy: status=healthy, p95_latency_ms=300ms, error_rate=1%, connection_pool_usage=40%, cpu_usage=35%. A log line at 11:20:01Z reports 'intermittent request latency' without diagnostic detail, and a targeted search for timeout/connection/downstream failure logs returned no matches. On this evidence, the leading explanation is that the latency is genuinely intermittent and the sampled snapshot happened to be healthy, with no observable local resource saturation or downstream-failure signature. The root cause remains unconfirmed because the degraded window was not captured in any observation.",
   "hypotheses": [
-    "The reported latency is transient and occurred at times not covered by the single available metric sample, so no saturation or dependency signal was captured.",
-    "Database connection pool exhaustion causes intermittent request timeouts, but this is unverified since connection_pool_usage is only 40% at the sampled time.",
-    "A downstream dependency (e.g., payment-service) intermittently times out and causes cascading latency in order-service, but this is unverified as no dependency call metrics or timeout logs were observed.",
-    "The incident report itself lacked diagnostic detail, and there may be insufficient instrumentation to observe the intermittency."
+    "The reported intermittent latency is real but falls between metric samples, so the available snapshot under-samples the degraded window.",
+    "A transient downstream dependency degradation (payment-service or another downstream) causes brief latency spikes not present in the healthy snapshot.",
+    "No specific root cause is identifiable from current telemetry; the incident may be a reporting/observability gap rather than a measured service defect."
   ],
   "evidence": [
     {
       "id": "ev-001",
       "source": "metrics-provider",
       "content": "service=order-service, timestamp=2026-10-15T11:20:00Z, status=healthy, connection_pool_usage=40%, cpu_usage=35%, error_rate=1%, p95_latency_ms=300ms",
-      "created_at": "2026-10-16T05:30:32.9246919Z"
+      "created_at": "2026-10-16T12:10:38.3934225Z"
     },
     {
       "id": "ev-002",
-      "source": "metrics-provider",
-      "content": "service=order-service, timestamp=2026-10-15T11:20:00Z, status=healthy, connection_pool_usage=40%, cpu_usage=35%, error_rate=1%, p95_latency_ms=300ms",
-      "created_at": "2026-10-16T05:30:37.9148373Z"
+      "source": "logs-provider",
+      "content": "2026-10-15T11:20:01Z WARN service=order-service intermittent request latency reported without additional diagnostic details",
+      "created_at": "2026-10-16T12:10:43.5551568Z"
     },
     {
       "id": "ev-003",
       "source": "logs-provider",
-      "content": "2026-10-15T11:20:01Z WARN service=order-service intermittent request latency reported without additional diagnostic details",
-      "created_at": "2026-10-16T05:30:42.8250744Z"
+      "content": "No matching logs found.",
+      "created_at": "2026-10-16T12:10:49.1584532Z"
     }
   ],
   "plans": [
     {
       "tool_name": "query_metrics",
-      "rationale": "No observations have been collected yet. Querying service health metrics for the order service is the most direct way to characterize the intermittent latency (onset, magnitude, affected endpoints, correlated resource saturation) and to form testable hypotheses.",
-      "expected_observation": "Latency time series for the order service showing whether spikes are periodic or random, which upstream/downstream calls or resources (CPU, memory, DB connections, thread pools) correlate with the latency, and the time window of the anomaly."
-    },
-    {
-      "tool_name": "query_metrics",
-      "rationale": "Only one metric sample exists, showing healthy values; querying metrics again can collect additional samples over time to determine whether the reported intermittent latency is reproducible and whether any resource/connection pool saturation coincides with it.",
-      "target_hypothesis_id": "hyp-3f8a1c2e",
-      "expected_observation": "Additional order-service metric samples, ideally any timestamps with elevated p95 latency, error rate, connection_pool_usage, or CPU usage that would indicate intermittent degradation."
+      "rationale": "No observations have been collected yet. Querying the order service's health metrics is the most direct first step to characterize the intermittent latency (e.g., response time percentiles, error rates, resource saturation) and begin forming evidence-based hypotheses.",
+      "expected_observation": "Latency, throughput, error rate, and resource utilization metrics for the order service, including any periodic/spiky patterns that explain intermittency."
     },
     {
       "tool_name": "search_logs",
-      "rationale": "The only metrics sample is healthy and comes from a single timestamp, so it cannot confirm or explain the reported intermittent latency. Searching logs for latency-related keywords may reveal transient errors, slow queries, or timeouts at unsampled moments that metrics did not capture, directly addressing the current inconclusive hypothesis.",
-      "target_hypothesis_id": "hyp-3f8a1c2e",
-      "expected_observation": "Log entries showing intermittent latency indicators such as slow query warnings, timeout exceptions, connection acquisition delays, or retry storms in order-service around or outside the sampled time."
+      "rationale": "The only evidence is a single healthy metrics snapshot, which cannot explain intermittent latency. Searching order-service logs for latency, timeout, and error keywords can reveal transient downstream timeouts or connection-pool issues that distinguish hyp-8f3d7a02 from a non-local saturation cause.",
+      "target_hypothesis_id": "hyp-8f3d7a02",
+      "expected_observation": "Log entries showing transient downstream dependency timeouts, slow dependency calls, or connection acquisition delays correlating with the reported intermittent latency."
+    },
+    {
+      "tool_name": "search_logs",
+      "rationale": "The incident is described as intermittent, so a single metric snapshot is unlikely to capture the degraded condition. Searching logs for downstream/timeout/connection-pool related keywords can reveal transient errors or dependency issues not present in the healthy snapshot, helping distinguish hyp-8f3d7a02 (downstream cause) from hyp-4c2a9b1e (local resource cause).",
+      "target_hypothesis_id": "hyp-8f3d7a02",
+      "expected_observation": "Log entries showing timeout, connection acquisition failures, downstream dependency errors, or connection pool exhaustion around the reported latency events."
     }
   ],
   "diagnosis_hypotheses": [
     {
-      "id": "hyp-3f8a1c2e",
-      "title": "No reproducible latency degradation at reported sample time",
-      "description": "The only available metric sample for order-service shows healthy status with p95 latency of 300ms, connection pool usage of 40%, CPU usage of 35%, and error rate of 1%. These values are consistent with the reported intermittency being absent during this specific sample, but they do not rule out latency occurring at other, unsampled times. Because only one distinct observation is available, no root-cause mechanism can be established, and the reported intermittent latency is neither confirmed nor explained.",
-      "status": "inconclusive",
+      "id": "hyp-2b6f0c4d",
+      "title": "Reported latency is intermittent and not observable in the available telemetry snapshot",
+      "description": "The available metric snapshot at 2026-10-15T11:20:00Z shows healthy status with p95_latency_ms=300ms, yet the log entry at 11:20:01Z reports intermittent request latency without diagnostic detail. Because the latency is described as intermittent and the sampled metric is healthy, the current evidence does not capture the degraded condition. This is a limitation-of-evidence hypothesis: it suggests the incident is real but insufficiently instrumented rather than identifying a specific cause.",
+      "status": "proposed",
+      "confidence": 0.2,
+      "evidence": [
+        {
+          "evidence_id": "ev-001",
+          "relation": "neutral",
+          "reason": "The healthy snapshot with p95_latency_ms=300ms neither confirms nor refutes intermittent latency; it only shows the state at one sampled instant."
+        },
+        {
+          "evidence_id": "ev-002",
+          "relation": "supports",
+          "reason": "The log explicitly reports intermittent request latency for order-service without additional diagnostic details, consistent with an intermittent condition that the metric snapshot may not have sampled."
+        }
+      ]
+    },
+    {
+      "id": "hyp-4c2a9b1e",
+      "title": "Order service latency is not driven by local resource saturation",
+      "description": "The available metric for the order service shows healthy status, low error rate (1%), and moderate resource utilization (connection_pool_usage=40%, cpu_usage=35%), with p95_latency_ms=300ms. There is no evidence of local resource saturation or a leak in this snapshot. The intermittent latency may originate outside the order service or from transient conditions not captured in this single observation. This remains a tentative interpretation since a single healthy sample cannot characterize the intermittent behavior.",
+      "status": "proposed",
       "confidence": 0.3,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "neutral",
-          "reason": "This single sample shows status=healthy with p95_latency_ms=300ms, error_rate=1%, cpu_usage=35%, and connection_pool_usage=40%. It neither demonstrates elevated latency or resource saturation nor provides a mechanism for intermittent slowness."
-        },
-        {
-          "evidence_id": "ev-002",
-          "relation": "neutral",
-          "reason": "This sample contains the same timestamp and identical values as ev-001, so it adds no independent observation. It does not strengthen or weaken any root-cause explanation."
+          "reason": "A single healthy snapshot with low error rate and moderate resource usage neither supports a local saturation cause nor explains the reported intermittent latency."
         }
       ]
     },
     {
-      "id": "hyp-a1b2c3d4",
-      "title": "Insufficient diagnostics to identify a root cause",
-      "description": "The only log line reporting the latency is a WARN stating that intermittent request latency was reported 'without additional diagnostic details', and the sole metric sample is healthy. This suggests the incident is currently unobservable or lacked instrumentation at the time it was reported, meaning no specific saturation, dependency, or application-level mechanism can be isolated from the supplied evidence. This hypothesis does not assert that latency is absent, only that the evidence is insufficient to explain it.",
-      "status": "inconclusive",
+      "id": "hyp-8f3d7a02",
+      "title": "Intermittent latency may be caused by a transient downstream dependency issue",
+      "description": "The order service snapshot is healthy at the sampled time, so a persistent internal cause is unlikely. Intermittent latency in a service can plausibly arise from brief downstream dependency degradation or transient network conditions not visible in a single snapshot. This remains unverified because no dependency or tracing evidence is available.",
+      "status": "proposed",
       "confidence": 0.25,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "neutral",
-          "reason": "A healthy status with p95_latency_ms=300ms, error_rate=1%, cpu_usage=35%, and connection_pool_usage=40% at the sampled time is consistent with a transient or unsampled condition, but it neither confirms nor refutes the lack of diagnostics."
-        },
-        {
-          "evidence_id": "ev-003",
-          "relation": "supports",
-          "reason": "The WARN explicitly notes the latency was reported 'without additional diagnostic details', directly supporting the claim that diagnostic information is insufficient to attribute a cause."
+          "reason": "The healthy snapshot does not rule out brief downstream degradation that could cause intermittent latency; it provides no dependency evidence either way."
         }
       ]
     }
   ],
   "observed_facts": [
-    "query_metrics returned service=order-service, timestamp=2026-10-15T11:20:00Z, status=healthy, connection_pool_usage=40%, cpu_usage=35%, error_rate=1%, p95_latency_ms=300ms.",
-    "A second query_metrics call returned an identical sample with the same timestamp and values (2026-10-15T11:20:00Z), adding no independent observation.",
-    "search_logs returned one entry: 2026-10-15T11:20:01Z WARN service=order-service intermittent request latency reported without additional diagnostic details.",
-    "No slow-query, timeout, connection-acquisition, retry, or error logs were observed for order-service."
+    "query_metrics for order-service at 2026-10-15T11:20:00Z returned status=healthy, p95_latency_ms=300ms, error_rate=1%, connection_pool_usage=40%, cpu_usage=35%.",
+    "search_logs returned a WARN at 2026-10-15T11:20:01Z: 'service=order-service intermittent request latency reported without additional diagnostic details'.",
+    "A second targeted search_logs for timeout/connection-acquisition/downstream error/retry returned 'No matching logs found'."
   ],
   "supporting_evidence": [
-    "The WARN log confirms that intermittent latency was reported for order-service but explicitly notes a lack of additional diagnostic details, matching the absence of observable anomalies in metrics."
+    "The WARN log explicitly reports intermittent latency for order-service, confirming a reported incident exists.",
+    "The single healthy metric snapshot at low error rate (1%) and moderate resource usage (cpu 35%, pool 40%) argues against persistent local resource saturation as the cause."
   ],
   "refuting_evidence": [
-    "The only metric sample shows status=healthy with p95_latency_ms=300ms, error_rate=1%, cpu_usage=35%, and connection_pool_usage=40%, none of which indicate latency degradation or resource/connection saturation.",
-    "No timeout, slow-query, or connection-pool-exhaustion log entries were found, which argues against connection_pool or downstream_timeout mechanisms at the observed time.",
-    "CPU (35%) and connection pool (40%) utilization are far from saturation, refuting resource-exhaustion explanations for the sampled moment."
+    "The metric snapshot shows p95_latency_ms=300ms with healthy status, which does not itself exhibit elevated latency.",
+    "No log entries matching timeout, connection acquisition failure, downstream error, or retry spikes were found, providing no support for a downstream or connection-pool root cause."
   ],
   "unverified_issues": [
-    "Whether the intermittent latency is reproducible at any unsampled timestamp.",
-    "Whether a downstream dependency (e.g., payment-service) exhibits intermittent timeouts, as no dependency metrics or call logs were collected.",
-    "Whether database query latency or lock waits contribute, as no query-level metrics or slow-query logs were observed.",
-    "The time window, magnitude, and affected endpoints of the reported latency.",
-    "Whether the intermittency is real versus a reporting artifact."
+    "The actual latency values during the reported degraded intervals were never observed; only a single healthy snapshot exists.",
+    "Whether a downstream dependency (e.g., payment-service) is degraded was not tested; no downstream metrics or traces were collected.",
+    "Whether the intermittency is time-correlated with any periodic event, deployment, or traffic spike is unknown.",
+    "The significance of the 1% error rate (baseline vs. elevated) is not established."
   ],
   "confidence": "low",
   "next_steps": [
-    "Collect metric time series for order-service (p50/p95/p99 latency, error rate) over the full reported incident window rather than a single sample.",
-    "Query metrics and logs for downstream dependencies such as payment-service to check for intermittent timeouts or latency spikes.",
-    "Search database-layer metrics/logs for slow queries, lock waits, and connection acquisition delays during the reported latency periods.",
-    "Obtain the specific timestamps, affected endpoints, and any client-side traces associated with the reported intermittent latency."
+    "Collect time-series metrics over the affected window (not a single snapshot) for order-service p95/p99 latency, error rate, CPU, and connection_pool_usage to locate the intermittent spikes.",
+    "Query downstream dependency metrics (e.g., payment-service) latency and error rates over the same window to test the downstream_timeout hypothesis.",
+    "Enable trace-level sampling and correlate slow requests with downstream call durations and connection-acquisition wait times.",
+    "Check for periodic patterns (cron jobs, batch processes, GC pauses) temporally aligned with the latency spikes."
   ],
   "knowledge": [
     {

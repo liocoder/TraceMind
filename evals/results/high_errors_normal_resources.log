@@ -2,12 +2,12 @@
 Mock dataset: D:\code\tracemind\evals\datasets\observations.json
 Mock scenario: high_errors_normal_resources
 
-[TraceMind] tool=query_metrics arguments={"service": "order-service"}
-[TraceMind] result=service=order-service, timestamp=2026-10-15T11:00:00Z, status=degraded, connection_pool_usage=32%, cpu_usage=28%, error_rate=22%, p95_latency_ms=650ms
-[TraceMind] tool=search_logs arguments={"query": "order-service error rate high downstream timeout dependency failure"}
+[TraceMind] tool=search_logs arguments={"query": "order service high error rate error exception failure"}
 [TraceMind] result=2026-10-15T11:00:01Z ERROR service=order-service business validation failed due to invalid order state
 2026-10-15T11:00:02Z ERROR service=order-service request rejected because required business field is missing
-[TraceMind] tool=search_logs arguments={"query": "order-service timeout exception downstream payment-service connection refused stack trace"}
+[TraceMind] tool=query_metrics arguments={"service": "order-service"}
+[TraceMind] result=service=order-service, timestamp=2026-10-15T11:00:00Z, status=degraded, connection_pool_usage=32%, cpu_usage=28%, error_rate=22%, p95_latency_ms=650ms
+[TraceMind] tool=search_logs arguments={"query": "order-service upstream caller payment-service request source invalid order state missing field"}
 [TraceMind] result=2026-10-15T11:00:01Z ERROR service=order-service business validation failed due to invalid order state
 2026-10-15T11:00:02Z ERROR service=order-service request rejected because required business field is missing
 {
@@ -28,148 +28,139 @@ Mock scenario: high_errors_normal_resources
     "completed"
   ],
   "tool_calls": 3,
-  "summary": "The order service is reporting a degraded state with error_rate=22% and p95_latency_ms=650ms, while its own resource metrics are low (connection_pool_usage=32%, cpu_usage=28%). Logs collected at the incident time show two recurring error classes: 'business validation failed due to invalid order state' and 'request rejected because required business field is missing'. These observations point most plausibly to request-level/business-validation failures rather than local resource exhaustion, since there is no evidence of connection-pool saturation or CPU pressure. However, searches for downstream/dependency errors (timeouts, connection refused, exceptions, stack traces) returned no such entries, and the logs do not quantify how much of the 22% error rate the validation rejections explain. The source of the invalid/incomplete requests (client input, upstream caller change, or a code/config change) remains unknown, so the root cause is not confirmed.",
+  "summary": "The order-service is in a degraded state with an observed error_rate of 22% and p95 latency of 650ms at 2026-10-15T11:00:00Z. The only error log entries observed are business-level validation rejections ('invalid order state' and 'missing required business field'). Resource metrics (connection_pool_usage=32%, cpu_usage=28%) show no saturation, which is consistent with an application/business-logic cause rather than a resource-exhaustion or connection-pool incident, and there is no direct log evidence of downstream/dependency timeouts. The leading explanation is that failing business validation is producing the elevated error rate, but the available evidence is limited to a short log sample and a single metric snapshot; the specific validation rule, the origin of the malformed requests, and any upstream caller responsible remain unverified.",
   "hypotheses": [
-    "Elevated error rate is driven largely by business-validation and missing-field rejections of incoming order requests.",
-    "A code or configuration fault in order-service (e.g., changed or newly strict validation logic) causes valid-looking requests to be rejected.",
-    "An upstream caller changed request payloads, producing invalid order state / missing required fields.",
-    "An unobserved downstream dependency or latency issue contributes to errors, though no dependency-level errors appeared in the log searches."
+    "Order-service errors are primarily driven by business validation failures (invalid order state and missing required business fields) rather than infrastructure saturation.",
+    "An upstream caller is sending malformed requests (invalid order state / missing fields), which the order-service correctly rejects, making the root cause lie outside the order-service.",
+    "A downstream dependency timeout is indirectly causing order-service failures (considered but not supported by observed logs)."
   ],
   "evidence": [
     {
       "id": "ev-001",
-      "source": "metrics-provider",
-      "content": "service=order-service, timestamp=2026-10-15T11:00:00Z, status=degraded, connection_pool_usage=32%, cpu_usage=28%, error_rate=22%, p95_latency_ms=650ms",
-      "created_at": "2026-10-16T05:29:43.5129818Z"
+      "source": "logs-provider",
+      "content": "2026-10-15T11:00:01Z ERROR service=order-service business validation failed due to invalid order state\n2026-10-15T11:00:02Z ERROR service=order-service request rejected because required business field is missing",
+      "created_at": "2026-10-16T12:09:45.5159983Z"
     },
     {
       "id": "ev-002",
-      "source": "logs-provider",
-      "content": "2026-10-15T11:00:01Z ERROR service=order-service business validation failed due to invalid order state\n2026-10-15T11:00:02Z ERROR service=order-service request rejected because required business field is missing",
-      "created_at": "2026-10-16T05:29:49.0832669Z"
+      "source": "metrics-provider",
+      "content": "service=order-service, timestamp=2026-10-15T11:00:00Z, status=degraded, connection_pool_usage=32%, cpu_usage=28%, error_rate=22%, p95_latency_ms=650ms",
+      "created_at": "2026-10-16T12:09:49.8288979Z"
     },
     {
       "id": "ev-003",
       "source": "logs-provider",
       "content": "2026-10-15T11:00:01Z ERROR service=order-service business validation failed due to invalid order state\n2026-10-15T11:00:02Z ERROR service=order-service request rejected because required business field is missing",
-      "created_at": "2026-10-16T05:29:55.5406039Z"
+      "created_at": "2026-10-16T12:09:55.9300375Z"
     }
   ],
   "plans": [
     {
+      "tool_name": "search_logs",
+      "rationale": "No observations or hypotheses exist yet. Searching the order service logs for errors is the most direct way to establish concrete evidence about the high error rate and begin forming hypotheses.",
+      "expected_observation": "Error/exception messages, stack traces, or failure patterns in the order service logs that indicate what is failing and why."
+    },
+    {
       "tool_name": "query_metrics",
-      "rationale": "No evidence has been collected yet. The most direct first step for a high error rate on the order service is to inspect its health metrics to confirm the symptom, identify which error/latency/throughput signals are abnormal, and narrow the scope for subsequent log searches.",
-      "expected_observation": "Error rate metric for the order service over recent time, plus related metrics such as latency, throughput, resource usage, and downstream dependency errors that indicate where the failures originate."
+      "rationale": "The only evidence so far is a short log sample showing validation errors. Querying order-service health metrics will distinguish whether the high error rate correlates with business validation failures or with infrastructure/dependency issues such as downstream timeouts, and will show the actual error-rate magnitude and timing.",
+      "target_hypothesis_id": "hyp-1a4b2c7d",
+      "expected_observation": "Error rate, latency, and resource/dependency metrics for order-service; elevated CPU, latency, or downstream error indicators would point away from pure validation failures, while a pure error-rate spike without resource/latency anomalies would support the validation hypothesis."
     },
     {
       "tool_name": "search_logs",
-      "rationale": "The leading plausible hypothesis (hyp-e01a7c3b) claims errors stem from a downstream dependency failure, code fault, or external dependency, but logs have not been examined. Searching logs for the order service is the most direct way to distinguish among these causes and either support or refute the hypothesis.",
-      "target_hypothesis_id": "hyp-e01a7c3b",
-      "expected_observation": "Log entries showing errors such as downstream call timeouts, connection refused, exceptions/stack traces, or dependency-related failures (or absence of such errors) around the incident time."
-    },
-    {
-      "tool_name": "search_logs",
-      "rationale": "The logs currently show only business-validation rejections (ev-002), which cannot fully explain a 22% error rate. Searching logs for dependency/timeout/exception keywords can distinguish hyp-e01a7c3b (dependency or code-level fault) from hyp-7c3ab9e2 (validation rejections) and test the downstream_timeout skill guidance.",
-      "target_hypothesis_id": "hyp-e01a7c3b",
-      "expected_observation": "Log entries showing downstream dependency call failures, timeouts, connection errors, or stack traces/exceptions from order-service that would support or refute a dependency/code-level fault rather than pure business-validation rejections."
+      "rationale": "The two competing hypotheses differ in the origin of the malformed requests: internal validation logic versus an upstream caller. Searching logs for caller/request identifiers, upstream service names, or request payload details can reveal whether the bad requests come from a specific upstream source, distinguishing hyp-2b7d9e14 from hyp-1a4b2c7d.",
+      "target_hypothesis_id": "hyp-2b7d9e14",
+      "expected_observation": "Log entries showing the source (caller service, client ID, request payload) of the validation-failing requests, or evidence that the order service itself generates invalid state internally."
     }
   ],
   "diagnosis_hypotheses": [
     {
-      "id": "hyp-4b2f9d18",
-      "title": "Connection pool saturation contributes to errors",
-      "description": "High connection pool utilization could cause request failures or latency if the pool is exhausted. However, the reported connection_pool_usage of 32% does not indicate saturation; it is well below typical exhaustion thresholds. This hypothesis remains unsupported by the current metric, and evidence about pool wait times or size limits would be needed to establish relevance.",
-      "status": "refuted",
-      "confidence": 0.1,
+      "id": "hyp-1a4b2c7d",
+      "title": "Order service errors caused by failing business validation",
+      "description": "The elevated error rate in the order service may be caused by business validation failures, such as requests arriving with invalid order state or missing required business fields. The available logs show validation-level rejections rather than infrastructure or dependency failures, so the errors appear to originate from input or business-rule checks. The metrics show connection pool usage (32%) and CPU (28%) below saturation levels, which makes resource saturation a less likely driver and is consistent with an application-level validation cause. Because only a short time window and limited evidence are available, this remains a plausible but unconfirmed explanation; it does not establish which specific validation or upstream caller is responsible.",
+      "status": "supported",
+      "confidence": 0.6,
       "evidence": [
         {
           "evidence_id": "ev-001",
-          "relation": "refutes",
-          "reason": "connection_pool_usage is reported at 32%, which is low and does not indicate pool exhaustion or saturation; this contradicts the idea that connection pool saturation is driving the errors."
-        }
-      ]
-    },
-    {
-      "id": "hyp-7c3ab9e2",
-      "title": "Business validation and missing business field rejections account for the elevated error rate",
-      "description": "The order service logs show errors at the same time as the degraded status: business validation failed due to invalid order state, and requests rejected because a required business field is missing. This suggests at least part of the 22% error rate may be driven by request data that fails validation rather than by infrastructure saturation. However, the logs only provide two illustrative error lines and do not quantify how much of the overall error rate they explain, nor do they establish the source of the invalid or incomplete requests (client input, upstream caller change, or code change). The duplicate log evidence (ev-002 and ev-003) provides no additional independent support.",
-      "status": "proposed",
-      "confidence": 0.35,
-      "evidence": [
-        {
-          "evidence_id": "ev-001",
-          "relation": "neutral",
-          "reason": "The metric snapshot shows the service degraded with error_rate 22% and low connection_pool_usage and cpu_usage, providing the overall error context but neither confirming nor refuting that business validation rejections cause the errors."
+          "relation": "supports",
+          "reason": "The log entries directly show the order service emitting business validation errors: requests rejected for invalid order state and for a missing required business field. These are observed error conditions consistent with validation failures contributing to the high error rate."
         },
         {
           "evidence_id": "ev-002",
           "relation": "supports",
-          "reason": "The logs record order-service errors about business validation failing due to invalid order state and requests rejected for a missing required business field, which is a direct class of request failures that could contribute to the reported high error rate."
+          "reason": "The metrics report status=degraded and error_rate=22% for the order service, confirming the elevated error rate, while connection_pool_usage=32% and cpu_usage=28% indicate these resource metrics are not near saturation, consistent with an application-level validation cause rather than resource exhaustion."
         },
         {
           "evidence_id": "ev-003",
           "relation": "supports",
-          "reason": "This log evidence is identical in content to ev-002, describing the same business validation failure and missing required business field rejection at the same timestamps; it corroborates the same observations but adds no independent information."
+          "reason": "These log entries repeat the same business validation errors seen in ev-001: requests rejected for invalid order state and for a missing required business field, reinforcing that validation-level rejections are occurring in the observed window."
         }
       ]
     },
     {
-      "id": "hyp-e01a7c3b",
-      "title": "Order service internal dependency or code-level fault drives elevated errors",
-      "description": "The order service is degraded with an error_rate of 22% and p95 latency of 650ms, while its own connection_pool_usage (32%) and cpu_usage (28%) are both low. The absence of local resource saturation suggests the high error rate and latency are more likely caused by a factor not visible in these metrics, such as a code or configuration fault, or an external dependency behaving slowly. This hypothesis is partially in tension with the observed business validation errors, which point to request-level causes rather than purely internal or dependency faults, but it remains plausible because no dependency-level traces, logs, or downstream metrics are available.",
+      "id": "hyp-2b7d9e14",
+      "title": "Order service errors driven by an upstream caller sending malformed requests",
+      "description": "The validation errors in the logs could originate from an upstream caller or client sending requests with invalid order state or missing required business fields, rather than from a defect in the order service itself. This is a plausible alternative to an internal validation fault, since the logs only show that the order service rejected the requests, not why the requests were malformed. There is currently no evidence identifying or characterizing the upstream caller, so this hypothesis is speculative and cannot be confirmed with the available data.",
       "status": "proposed",
       "confidence": 0.25,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "supports",
-          "reason": "The service is marked degraded with an error_rate of 22% and p95 latency of 650ms, but connection_pool_usage is 32% and cpu_usage is 28%, indicating the elevated errors and latency are not accompanied by local resource saturation, which is consistent with an internal or dependency-level fault rather than local resource exhaustion."
+          "reason": "The logs show requests being rejected because of invalid order state and a missing required business field, which is consistent with malformed input arriving from an upstream caller, though the source of the malformed requests is not shown."
         },
         {
           "evidence_id": "ev-002",
           "relation": "neutral",
-          "reason": "The logged business validation failures and missing-field rejections indicate a request-data class of errors, which is neither clearly consistent with nor contrary to an internal dependency or code-level fault; they could reflect upstream request changes or internal validation code."
+          "reason": "The metrics confirm the order service error rate is elevated and resources are not saturated, but they do not indicate anything about the identity or behavior of any upstream caller."
+        },
+        {
+          "evidence_id": "ev-003",
+          "relation": "supports",
+          "reason": "The repeated log entries showing rejected requests for invalid order state and a missing required business field are consistent with recurring malformed input from a caller, but they still do not identify the source of the malformed requests."
         }
       ]
     }
   ],
   "observed_facts": [
-    "query_metrics returned service=order-service, status=degraded, error_rate=22%, p95_latency_ms=650ms, connection_pool_usage=32%, cpu_usage=28% at 2026-10-15T11:00:00Z.",
-    "Logs at 2026-10-15T11:00:01Z show ERROR order-service 'business validation failed due to invalid order state'.",
-    "Logs at 2026-10-15T11:00:02Z show ERROR order-service 'request rejected because required business field is missing'.",
-    "A second log search for timeout/exception/downstream/payment-service/connection-refused keywords returned only the same two business-validation error lines, with no downstream timeout or connection error entries."
+    "order-service log at 2026-10-15T11:00:01Z: 'business validation failed due to invalid order state'.",
+    "order-service log at 2026-10-15T11:00:02Z: 'request rejected because required business field is missing'.",
+    "order-service metrics at 2026-10-15T11:00:00Z: status=degraded, error_rate=22%, p95_latency_ms=650ms, connection_pool_usage=32%, cpu_usage=28%.",
+    "Repeated log searches returned only the same two validation-error messages; no stack traces, dependency errors, or caller identifiers appeared."
   ],
   "supporting_evidence": [
-    "Error rate is elevated (22%) and the service is marked degraded, confirming the reported symptom.",
-    "Logs directly record two classes of request-rejection errors on order-service coincident with the incident time.",
-    "connection_pool_usage=32% and cpu_usage=28% are low, arguing against local resource exhaustion (e.g., connection pool saturation) as the cause."
+    "The only error conditions captured in logs are business validation rejections, directly tied to the observed error behavior.",
+    "error_rate=22% confirms an elevated error rate concurrent with the logged validation errors.",
+    "connection_pool_usage=32% and cpu_usage=28% are well below saturation, arguing against connection-pool exhaustion or CPU-bound causes.",
+    "No downstream/dependency timeout or connection-acquisition failure messages were observed in the logs."
   ],
   "refuting_evidence": [
-    "No downstream/dependency timeout, connection-refused, or exception/stack-trace log entries were found, which argues against a dependency-timeout or code-exception root cause.",
-    "connection_pool_usage=32% is far below typical exhaustion thresholds, refuting connection-pool saturation.",
-    "The logs do not establish that business-validation rejections account for the full 22% error rate."
+    "No log evidence confirms downstream/dependency timeouts, so the downstream_timeout skill pattern is not supported by current observations.",
+    "Resource metrics are not saturated, contradicting a connection-pool or resource-exhaustion explanation.",
+    "Log entries do not identify the source or payload of the rejected requests, so an internal validation defect versus external malformed input cannot be distinguished."
   ],
   "unverified_issues": [
-    "Proportion of the 22% error rate attributable to business-validation and missing-field rejections versus other error sources is unknown.",
-    "The origin of the invalid order state and missing required field (client, upstream caller, or internal code/config change) is not determined.",
-    "Whether any downstream dependency (e.g., payment-service) is degraded is unverified, since no dependency metrics or traces were collected.",
-    "Whether p95 latency of 650ms is abnormal versus baseline is unverified (no baseline metric available)."
+    "The specific validation rule or business field that is failing is unknown.",
+    "The origin of the invalid/malformed requests (internal logic vs. specific upstream caller) is unidentified.",
+    "Whether the 22% error rate is entirely attributable to validation failures or includes additional unlogged error types is unconfirmed.",
+    "No downstream dependency behavior (e.g., payment-service) was directly inspected in an observable way.",
+    "The time window examined is short; whether the validation errors are a spike or ongoing condition is unknown."
   ],
   "confidence": "low",
   "next_steps": [
-    "Check whether a recent order-service code/config change modified validation rules or required fields.",
-    "Compare error rate by error type to quantify the share from validation vs. other causes.",
-    "Inspect upstream caller request payloads/changes to determine whether invalid requests originate externally.",
-    "Collect downstream dependency metrics and traces (e.g., payment-service) to rule out latent dependency degradation.",
-    "Review database query latency/lock metrics to explain the 650ms p95 latency independently of the validation errors."
+    "Fetch a larger and longer log sample with full request payloads and caller/upstream identifiers to identify which caller and which field/rule is failing.",
+    "Query order-service metrics broken down by error type and over a wider time range to quantify the validation-error share of the 22% error rate.",
+    "Inspect upstream callers (e.g., payment-service or API gateway) to determine whether malformed requests originate externally.",
+    "Confirm there are no other error classes (timeouts, 5xx from dependencies) by checking dependency metrics and logs."
   ],
   "knowledge": [
     {
-      "name": "connection_pool",
+      "name": "downstream_timeout",
       "level": "summary"
     },
     {
-      "name": "downstream_timeout",
+      "name": "connection_pool",
       "level": "summary"
     }
   ]

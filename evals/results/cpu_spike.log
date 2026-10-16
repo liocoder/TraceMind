@@ -4,7 +4,7 @@ Mock scenario: cpu_spike
 
 [TraceMind] tool=query_metrics arguments={"service": "order-service"}
 [TraceMind] result=service=order-service, timestamp=2026-10-15T10:10:00Z, status=degraded, connection_pool_usage=35%, cpu_usage=99%, error_rate=12%, p95_latency_ms=2400ms
-[TraceMind] tool=search_logs arguments={"query": "order-service timeout error slow high CPU latency"}
+[TraceMind] tool=search_logs arguments={"query": "order-service slow error rate increase timeout latency"}
 [TraceMind] result=2026-10-15T10:10:01Z WARN service=order-service CPU utilization above 95 percent for five minutes
 2026-10-15T10:10:02Z ERROR service=order-service request processing delayed under high CPU load
 [TraceMind] tool=query_metrics arguments={"service": "order-service"}
@@ -27,131 +27,111 @@ Mock scenario: cpu_spike
     "completed"
   ],
   "tool_calls": 3,
-  "summary": "The order-service is degraded with cpu_usage=99%, error_rate=12%, and p95_latency_ms=2400ms as of 2026-10-15T10:10:00Z. Logs corroborate sustained CPU utilization above 95% for five minutes and report that request processing is delayed under high CPU load. The evidence consistently points to CPU saturation as the leading explanation for the elevated latency and error rate. Connection pool usage is only 35%, which argues against connection pool exhaustion, and no downstream dependency evidence was collected. The underlying driver of the high CPU (increased traffic, a runaway process/hot loop, or another cause) could not be determined from available data, and the second metrics query returned identical values without any traffic or request-rate breakdown.",
+  "summary": "The order-service is in a degraded state, with a single metrics snapshot showing cpu_usage=99%, error_rate=12%, p95_latency_ms=2400ms, and connection_pool_usage=35%. Logs at the same time record that CPU utilization exceeded 95% for five minutes and that request processing was delayed under high CPU load. This is consistent with order-service CPU saturation being the leading driver of elevated latency and errors, and connection pool saturation is not indicated. However, the evidence is essentially one metrics snapshot (queried twice at the same timestamp, so it is duplicated rather than independent), and the causal direction and any external contributor (e.g., a downstream dependency driving extra load) remain unverified. CPU saturation is a supported leading hypothesis, not a confirmed root cause.",
   "hypotheses": [
-    "CPU saturation in the order service is driving the elevated latency and error rate (supported by metrics and logs, but causality and the reason for high CPU remain unverified).",
-    "Elevated workload or traffic is causing resource contention and CPU saturation (plausible but unverified; no request-rate, throughput, or queue-depth metrics were available).",
-    "A downstream dependency timeout is propagating failures into the order service (not evaluated in this investigation; no downstream evidence collected)."
+    "Order-service CPU saturation is causing request processing delays and elevated error rate.",
+    "An upstream or workload surge (e.g., a traffic spike or a hot code path) is driving the CPU to 99%, making CPU saturation a symptom rather than the origin.",
+    "A downstream dependency (e.g., payment-service) is slow, causing order-service requests to accumulate and consume more CPU, contributing to latency and errors."
   ],
   "evidence": [
     {
       "id": "ev-001",
       "source": "metrics-provider",
       "content": "service=order-service, timestamp=2026-10-15T10:10:00Z, status=degraded, connection_pool_usage=35%, cpu_usage=99%, error_rate=12%, p95_latency_ms=2400ms",
-      "created_at": "2026-10-16T05:27:46.6998004Z"
+      "created_at": "2026-10-16T12:07:50.1429418Z"
     },
     {
       "id": "ev-002",
       "source": "logs-provider",
       "content": "2026-10-15T10:10:01Z WARN service=order-service CPU utilization above 95 percent for five minutes\n2026-10-15T10:10:02Z ERROR service=order-service request processing delayed under high CPU load",
-      "created_at": "2026-10-16T05:27:52.8801435Z"
+      "created_at": "2026-10-16T12:07:54.574197Z"
     },
     {
       "id": "ev-003",
       "source": "metrics-provider",
       "content": "service=order-service, timestamp=2026-10-15T10:10:00Z, status=degraded, connection_pool_usage=35%, cpu_usage=99%, error_rate=12%, p95_latency_ms=2400ms",
-      "created_at": "2026-10-16T05:27:58.7815578Z"
+      "created_at": "2026-10-16T12:07:59.5119073Z"
     }
   ],
   "plans": [
     {
       "tool_name": "query_metrics",
-      "rationale": "No observations have been collected yet. Querying service health metrics for the order service is the most direct first step to characterize the slowdown and elevated error rate, and to determine which resource (CPU, memory, latency, error rate) is anomalous.",
-      "expected_observation": "Metrics for the order service showing which resources or endpoints are degraded, e.g. elevated latency, CPU saturation, memory pressure, increased 5xx error rate, or downstream dependency latency."
+      "rationale": "No evidence has been collected yet. The order service is reported slow with increased errors, so the most direct first step is to inspect its observed health metrics (latency, error rate, saturation, dependency-level indicators) to ground the investigation and begin distinguishing competing causes.",
+      "expected_observation": "Latency percentiles, error-rate, throughput, resource saturation (CPU/memory/connections), or dependency-specific metric anomalies for the order service that indicate where the degradation originates."
     },
     {
       "tool_name": "search_logs",
-      "rationale": "The current evidence shows CPU saturation but the underlying cause is unclear (e.g., runaway process/hot loop vs. elevated workload). Searching logs for error patterns, timeouts, or traffic-related messages can distinguish between the competing hypotheses and reveal any downstream dependency issues.",
-      "expected_observation": "Log entries showing error types, timeout messages, request volume indicators, or signs of a runaway process/hot loop that would clarify whether CPU saturation is driven by workload versus an internal defect."
+      "rationale": "The only evidence is a single metrics snapshot showing high CPU and elevated errors. Logs can reveal the actual failure mode (e.g., timeouts, GC pauses, downstream errors, connection acquisition failures) and help distinguish whether CPU saturation is causing errors versus an external/downstream driver or a different bottleneck.",
+      "target_hypothesis_id": "hyp-3b7f1a2c",
+      "expected_observation": "Log entries around the incident showing error/timeout patterns, exception types, slow operation names, or downstream dependency failures that clarify the mechanism behind elevated latency and error rate."
     },
     {
       "tool_name": "query_metrics",
-      "rationale": "CPU saturation is already established by metrics and logs, but the driver is unresolved: hyp-3f7a91c2 (CPU saturation) and hyp-8b2c4d1e (elevated workload/traffic) both fit the current evidence, and connection_pool usage is only 35%, so pool exhaustion is not indicated. Querying service metrics again could retrieve traffic, request-rate, or queue-depth data that distinguishes increased demand from other CPU-consumption causes and confirms whether CPU saturation is the causal driver.",
-      "target_hypothesis_id": "hyp-8b2c4d1e",
-      "expected_observation": "Request rate, throughput, or queue-depth metrics for order-service showing whether demand increased, or additional CPU/thread metrics clarifying the source of high CPU usage."
+      "rationale": "The only hypothesis is CPU saturation, but it is based on a single metrics snapshot at one timestamp. Querying metrics again could reveal whether high CPU is sustained versus a spike, and whether other resources (memory, disk I/O, JVM/GC) also show anomalies that could compete as explanations for the latency and errors.",
+      "target_hypothesis_id": "hyp-3b7f1a2c",
+      "expected_observation": "Additional metric samples over time showing whether cpu_usage remains near 99% (supporting sustained CPU saturation) or was transient, plus any co-occurring resource or runtime anomalies (e.g., memory pressure, GC pauses) that would weaken or compete with the CPU hypothesis."
     }
   ],
   "diagnosis_hypotheses": [
     {
-      "id": "hyp-3f7a91c2",
-      "title": "CPU saturation in the order service",
-      "description": "The order service is degraded with cpu_usage reported at 99%, alongside an elevated error rate and p95 latency. This pattern is consistent with CPU saturation limiting the service's ability to process work in a timely manner, which could plausibly contribute to increased latency and errors. Logs independently note CPU utilization above 95 percent for five minutes and an error indicating request processing delayed under high CPU load, which strengthens the association between high CPU load and delayed request processing. However, the evidence does not establish the underlying cause of the high CPU usage (e.g., increased load, a runaway process, or a hot loop), nor does it prove that CPU saturation is the causal driver rather than a symptom of another condition.",
+      "id": "hyp-3b7f1a2c",
+      "title": "Order service CPU saturation degrades latency and errors",
+      "description": "The order service is reported as degraded with CPU usage at 99%, an error rate of 12%, and p95 latency of 2400ms. Sustained near-maximum CPU usage is consistent with CPU saturation that could increase request latency and, plausibly, error rate (e.g., timeouts or dropped work). Logs corroborate sustained high CPU: a warning states utilization was above 95% for five minutes, and an error states request processing was delayed under high CPU load. The causal direction is still not verified by tracing, and alternative contributors are not ruled out. Connection pool usage is 35%, which does not suggest pool saturation in this observation. Note that ev-001 and ev-003 are duplicate metrics snapshots at the same timestamp, so they do not provide independent corroboration.",
       "status": "supported",
-      "confidence": 0.55,
+      "confidence": 0.6,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "supports",
-          "reason": "Reports cpu_usage=99% for order-service together with status=degraded, error_rate=12%, and p95_latency_ms=2400ms, showing CPU near full utilization concurrent with degraded service behavior. This supports a saturation concern but does not by itself prove exhaustion of CPU capacity or causality."
+          "reason": "Single metrics snapshot shows order-service status=degraded with cpu_usage=99%, error_rate=12%, and p95_latency_ms=2400ms, consistent with CPU saturation contributing to slowness and errors; connection_pool_usage=35% does not indicate pool saturation."
         },
         {
           "evidence_id": "ev-002",
           "relation": "supports",
-          "reason": "Logs independently report CPU utilization above 95 percent for five minutes and an error stating request processing is delayed under high CPU load, corroborating sustained high CPU usage concurrent with a processing delay attributed to CPU load."
+          "reason": "Logs record a warning that order-service CPU utilization exceeded 95% for five minutes and an error that request processing was delayed under high CPU load, directly consistent with sustained CPU load affecting request handling."
         },
         {
           "evidence_id": "ev-003",
-          "relation": "supports",
-          "reason": "Repeats the same order-service reading of cpu_usage=99% with status=degraded, error_rate=12%, and p95_latency_ms=2400ms, restating the concurrent high CPU utilization and degraded service behavior."
-        }
-      ]
-    },
-    {
-      "id": "hyp-8b2c4d1e",
-      "title": "Elevated workload or traffic driving resource contention",
-      "description": "The combination of near-maximal CPU usage with elevated latency and errors in the order service could reflect an increase in demand or workload that the service is not provisioned to handle. Under this explanation, resource contention driven by higher request volume would manifest as CPU saturation with downstream error and latency inflation. The supplied evidence does not include request rate, queue depth, or traffic metrics, so this mechanism remains speculative and is only indirectly suggested by the service degradation and the log note of sustained high CPU load.",
-      "status": "proposed",
-      "confidence": 0.2,
-      "evidence": [
-        {
-          "evidence_id": "ev-001",
-          "relation": "supports",
-          "reason": "cpu_usage=99% with degraded status and error_rate=12% is consistent with the service being stressed by load the infrastructure cannot absorb, though no traffic or demand metric is provided to confirm increased workload."
-        },
-        {
-          "evidence_id": "ev-002",
           "relation": "neutral",
-          "reason": "Confirms sustained high CPU utilization and request processing delays under CPU load, but contains no information about request volume, traffic, or queue depth, so it neither supports nor refutes an increased-workload explanation."
+          "reason": "Duplicate of the ev-001 metrics snapshot at the same timestamp (same cpu_usage, error_rate, latency, and connection_pool_usage values); it restates the same degraded observation rather than adding independent support."
         }
       ]
     }
   ],
   "observed_facts": [
-    "Metrics for order-service at 2026-10-15T10:10:00Z: status=degraded, connection_pool_usage=35%, cpu_usage=99%, error_rate=12%, p95_latency_ms=2400ms.",
-    "A repeat metrics query returned identical values with no additional traffic or request-rate fields.",
-    "Log at 2026-10-15T10:10:01Z: WARN service=order-service CPU utilization above 95 percent for five minutes.",
-    "Log at 2026-10-15T10:10:02Z: ERROR service=order-service request processing delayed under high CPU load."
+    "query_metrics for order-service (2026-10-15T10:10:00Z) returned status=degraded, cpu_usage=99%, error_rate=12%, p95_latency_ms=2400ms, connection_pool_usage=35%.",
+    "A second query_metrics call returned the identical snapshot at the same timestamp (duplicate, not an independent sample).",
+    "Logs: 2026-10-15T10:10:01Z WARN service=order-service CPU utilization above 95 percent for five minutes.",
+    "Logs: 2026-10-15T10:10:02Z ERROR service=order-service request processing delayed under high CPU load."
   ],
   "supporting_evidence": [
-    "cpu_usage=99% concurrently with status=degraded, error_rate=12%, and p95_latency_ms=2400ms indicates CPU near full utilization during the degradation.",
-    "Logs independently confirm CPU utilization above 95% for a sustained five-minute window.",
-    "A log error explicitly attributes request processing delay to high CPU load, linking high CPU to the observed latency."
+    "CPU usage reported at 99%, indicating the order-service is essentially CPU-saturated.",
+    "Log warning confirms CPU utilization remained above 95% for five minutes, indicating sustained rather than momentary load.",
+    "Log error explicitly attributes request processing delay to high CPU load, aligning with the elevated p95 latency (2400ms) and 12% error rate.",
+    "connection_pool_usage=35% does not indicate connection pool exhaustion, so that matching skill's cause is not supported here."
   ],
   "refuting_evidence": [
-    "connection_pool_usage=35% is well below exhaustion, arguing against connection pool exhaustion as the cause.",
-    "No downstream dependency metrics or logs were retrieved, so no evidence supports a downstream-timeout explanation."
+    "No direct trace or profiling evidence establishes that CPU saturation is the root cause rather than a symptom of an upstream workload surge or a hot code path.",
+    "The two metrics observations are the same timestamp/value, so they provide no independent temporal corroboration of sustained CPU behavior."
   ],
   "unverified_issues": [
-    "The root cause of the high CPU usage (increased traffic, runaway process/hot loop, or other) is not established.",
-    "Whether CPU saturation is the causal driver versus a symptom of another condition is not proven.",
-    "No request-rate, throughput, or queue-depth metrics were available to confirm or rule out increased workload.",
-    "Downstream dependency health (e.g., payment-service) was never queried, so a downstream-contributed cascade remains unevaluated.",
-    "The exact time of onset and whether CPU rose before or after latency/errors is unknown."
+    "Whether high CPU is the origin of the incident or a consequence of an upstream workload surge or a hot code path.",
+    "Whether any downstream dependency (e.g., payment-service) is slow and contributing to order-service latency/errors.",
+    "The failure mode behind the 12% error rate (timeouts, exceptions, dropped work) is not identified from logs.",
+    "Whether CPU saturation was sustained across the incident window (only a duplicate snapshot plus one log statement are available).",
+    "Memory, GC, and disk I/O were not observed and cannot be ruled out as contributors."
   ],
   "confidence": "medium",
   "next_steps": [
-    "Query request-rate, throughput, and queue-depth metrics for order-service to determine whether demand increased.",
-    "Inspect process-level/thread-level CPU profiles or top-like data to detect a runaway process or hot loop.",
-    "Query metrics and logs for downstream dependencies (e.g., payment-service) to check for timeout-induced cascades.",
-    "Correlate timestamps of CPU rise against latency and error-rate rise to assess causal ordering."
+    "Collect order-service metrics across a time range (multiple samples) to confirm sustained CPU saturation versus a transient spike.",
+    "Search logs for the specific exception/timeout types and slow operation names behind the 12% error rate.",
+    "Check downstream dependencies (e.g., payment-service) latency and error metrics to rule out a downstream-driven chain failure.",
+    "Inspect request rate/throughput and any recent deployments to determine whether an upstream workload surge or a code change triggered the CPU spike.",
+    "Examine CPU profiles or thread dumps to identify the hot code path consuming CPU."
   ],
   "knowledge": [
     {
       "name": "connection_pool",
-      "level": "summary"
-    },
-    {
-      "name": "downstream_timeout",
       "level": "summary"
     }
   ]

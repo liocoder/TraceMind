@@ -4,7 +4,7 @@ Mock scenario: downstream_timeout
 
 [TraceMind] tool=query_metrics arguments={"service": "order-service"}
 [TraceMind] result=service=order-service, timestamp=2026-10-15T10:20:00Z, status=degraded, connection_pool_usage=91%, cpu_usage=38%, error_rate=10%, p95_latency_ms=3200ms
-[TraceMind] tool=search_logs arguments={"query": "order-service connection pool timeout dependency error downstream"}
+[TraceMind] tool=search_logs arguments={"query": "order-service connection pool timeout downstream dependency error"}
 [TraceMind] result=2026-10-15T10:20:01Z ERROR service=order-service downstream payment-service request timeout
 2026-10-15T10:20:02Z ERROR service=payment-service payment request exceeded upstream timeout deadline
 [TraceMind] tool=query_metrics arguments={"service": "payment-service"}
@@ -27,123 +27,120 @@ Mock scenario: downstream_timeout
     "completed"
   ],
   "tool_calls": 3,
-  "summary": "The order service is degraded with p95 latency of 3200ms, a 10% error rate, and connection_pool_usage of 91%, while CPU usage is only 38%. Logs directly show order-service requests to payment-service timing out, and payment-service is itself degraded with p95 latency of 4800ms and an 18% error rate. This supports a downstream-dependency chain in which a slow/erroring payment-service raises order-service latency and errors, plausibly with outbound calls holding order-service connections longer (consistent with the 91% pool utilization). The evidence establishes a failing call path and correlated degradation on payment-service, but does not include distributed traces or show payment-service's own internal cause, so the direction and precise mechanism remain inferential rather than proven.",
+  "summary": "The order-service is degraded (error_rate=10%, p95_latency=3200ms, connection_pool_usage=91%) with low CPU (38%). Logs at the same timestamp show order-service timing out on a downstream call to payment-service, and payment-service itself reports exceeding the upstream timeout deadline. payment-service metrics confirm it is also degraded (error_rate=18%, p95_latency=4800ms, CPU 40%). This is consistent with a downstream dependency (payment-service) being involved in the order-service degradation. However, whether payment-service is the ultimate root cause or itself a victim of a further downstream dependency is not established, and the role of the elevated order-service connection pool usage (91%) remains unverified.",
   "hypotheses": [
-    "Payment-service degradation (elevated latency and errors) causes order-service timeouts, higher latency, and errors via the order-to-payment call path.",
-    "Order-service outbound calls to a slow payment-service hold connections longer, driving connection_pool_usage to 91% and compounding latency/errors.",
-    "An upstream cause (e.g., a shared database or another dependency of payment-service) is degrading payment-service, which then propagates to order-service."
+    "order-service degradation is driven by a downstream dependency (payment-service) that is itself slow/degraded, causing cascading timeouts.",
+    "payment-service is itself degraded due to a further (unobserved) downstream dependency or internal resource issue, making it a mid-chain victim rather than the root cause.",
+    "order-service connection pool saturation (91%) independently contributes to its latency and errors, potentially to its database tier, separate from downstream timeout.",
+    "A shared external factor (e.g., network or infrastructure) simultaneously degrades both order-service and payment-service."
   ],
   "evidence": [
     {
       "id": "ev-001",
       "source": "metrics-provider",
       "content": "service=order-service, timestamp=2026-10-15T10:20:00Z, status=degraded, connection_pool_usage=91%, cpu_usage=38%, error_rate=10%, p95_latency_ms=3200ms",
-      "created_at": "2026-10-16T05:28:11.3665956Z"
+      "created_at": "2026-10-16T12:08:12.8563601Z"
     },
     {
       "id": "ev-002",
       "source": "logs-provider",
       "content": "2026-10-15T10:20:01Z ERROR service=order-service downstream payment-service request timeout\n2026-10-15T10:20:02Z ERROR service=payment-service payment request exceeded upstream timeout deadline",
-      "created_at": "2026-10-16T05:28:15.6453996Z"
+      "created_at": "2026-10-16T12:08:18.6837011Z"
     },
     {
       "id": "ev-003",
       "source": "metrics-provider",
       "content": "service=payment-service, timestamp=2026-10-15T10:20:00Z, status=degraded, cpu_usage=40%, error_rate=18%, p95_latency_ms=4800ms",
-      "created_at": "2026-10-16T05:28:20.591141Z"
+      "created_at": "2026-10-16T12:08:24.6740639Z"
     }
   ],
   "plans": [
     {
       "tool_name": "query_metrics",
-      "rationale": "No observations have been collected yet. Querying service health metrics for the order service is the most direct way to detect latency/error spikes and identify whether a downstream dependency is involved, which aligns with the incident and the downstream_timeout skill guidance.",
-      "expected_observation": "Metrics for the order service showing elevated latency and/or error rates, potentially revealing a specific downstream dependency with degraded metrics."
+      "rationale": "The incident is about the order service being slow and returning errors, and the top hypothesis is a dependency issue. Querying metrics for the order service is the fastest way to see error rates, latency, and dependency-related signals before diving into logs.",
+      "expected_observation": "Elevated latency and error rate for the order service, possibly correlated with a downstream dependency's metrics."
     },
     {
       "tool_name": "search_logs",
-      "rationale": "Metrics show connection_pool_usage at 91% but do not identify whether errors stem from pool exhaustion or from a slow/unavailable dependency. Searching logs for connection-acquisition failures, timeouts, and dependency names can distinguish between these competing mechanisms and reveal the specific downstream dependency involved.",
-      "target_hypothesis_id": "hyp-a1b2c3d4",
-      "expected_observation": "Log entries indicating connection pool exhaustion (timeouts acquiring connections) or explicit downstream dependency timeout/unavailability errors referencing a specific dependency name."
+      "rationale": "The two leading hypotheses are connection pool saturation versus a downstream dependency problem, and current metrics only cover the order service. Searching logs for errors related to connection acquisition, timeouts, or dependency calls can distinguish whether the pool is exhausted and which dependency is involved.",
+      "target_hypothesis_id": "hyp-5b2e8d41",
+      "expected_observation": "Logs indicating connection acquisition failures/pool timeouts or downstream dependency timeouts/errors that would confirm or refute dependency involvement."
     },
     {
       "tool_name": "query_metrics",
-      "rationale": "The current hypothesis is that payment-service (or another dependency) is slow/unresponsive and causing order-service connection pool pressure. We have metrics for order-service but not for payment-service. Querying payment-service metrics will help distinguish whether the dependency itself is degraded (e.g., its own latency, error rate, connection pool usage) versus whether the issue is local to order-service's connection handling. This evidence would confirm or refute the dependency-involvement mechanism.",
-      "target_hypothesis_id": "hyp-a1b2c3d4",
-      "expected_observation": "Metrics for payment-service showing degraded status, elevated latency, high error rate, or connection pool saturation, which would support the dependency-related degradation hypothesis. Alternatively, normal payment-service metrics would suggest the issue lies in order-service's outbound connection management or another dependency."
+      "rationale": "The logs name payment-service as the downstream dependency timing out, but there are no metrics for payment-service itself. Querying payment-service metrics can distinguish whether the timeout stems from payment-service resource saturation (CPU, connection pool, latency) versus order-service side timeout/config issues, directly addressing the supported dependency hypothesis.",
+      "target_hypothesis_id": "hyp-5b2e8d41",
+      "expected_observation": "payment-service metrics showing elevated latency, errors, connection pool usage, or CPU/memory saturation at the same timestamp, which would confirm a downstream dependency-driven cause rather than an order-service-internal issue."
     }
   ],
   "diagnosis_hypotheses": [
     {
-      "id": "hyp-7f3a91c2",
-      "title": "Payment-service degradation raises order-service latency and errors",
-      "description": "Payment-service is degraded with error_rate at 18% and p95 latency of 4800ms, and logs show order-service payment requests timing out. Because the order service calls payment-service, a slow or error-prone payment-service could plausibly increase order-service latency and error rate via timeouts. The order service also shows elevated connection_pool_usage, which could reflect outbound calls waiting on the dependency. This remains a hypothesis: the evidence shows temporal proximity and a downstream call path, but does not include tracing or direct causal proof, so the direction and extent of impact are not established.",
+      "id": "hyp-3f7a1c92",
+      "title": "Connection pool saturation in order service may be contributing to latency and errors",
+      "description": "The order service is reported as degraded with elevated connection pool usage (91%), elevated error rate (10%), and high p95 latency (3200ms). The connection pool is not explicitly identified as belonging to any specific dependency or resource type, so it is unclear whether this pool connects to a downstream dependency or is internal. The high pool usage is consistent with a saturation concern, but this metric alone does not establish exhaustion, queueing, a leak, or a causal link to the observed latency and errors. It also does not confirm that a dependency is involved.",
       "status": "proposed",
-      "confidence": 0.55,
+      "confidence": 0.35,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "supports",
-          "reason": "Shows order-service degraded with p95_latency_ms=3200, error_rate=10%, and connection_pool_usage=91%, consistent with order-service impact while a downstream dependency is slow, though causal direction is not proven."
-        },
-        {
-          "evidence_id": "ev-002",
-          "relation": "supports",
-          "reason": "Logs directly show order-service requests to payment-service timing out and payment-service reporting upstream timeout deadlines, establishing that calls from order-service to payment-service are failing or timing out."
-        },
-        {
-          "evidence_id": "ev-003",
-          "relation": "supports",
-          "reason": "Shows payment-service degraded with error_rate=18% and p95_latency_ms=4800, indicating the dependency itself is slow and error-prone, which is consistent with it contributing to order-service timeouts and latency."
+          "reason": "The metrics show connection_pool_usage=91% alongside error_rate=10% and p95_latency_ms=3200ms for order-service. The elevated pool usage is consistent with a saturation concern that could plausibly relate to latency and errors, though it does not by itself prove exhaustion, queueing, or a dependency-related root cause."
         }
       ]
     },
     {
-      "id": "hyp-a1b2c3d4",
-      "title": "Dependency connection pool saturation degrades order service",
-      "description": "The order service is degraded with connection_pool_usage at 91%, error_rate at 10%, and p95 latency of 3200ms, while cpu_usage is only 38%, so local compute saturation is not indicated. Logs show order-service requests to payment-service timing out, and payment-service reporting that requests exceeded an upstream timeout deadline. This is consistent with a slow or unresponsive downstream dependency causing requests to hold connections longer, but the evidence does not identify which connection pool is involved, confirm pool exhaustion or queueing, or establish causal direction. Confidence remains modest because the causal mechanism is unverified.",
-      "status": "proposed",
-      "confidence": 0.5,
+      "id": "hyp-5b2e8d41",
+      "title": "Order service degradation may be driven by a downstream dependency rather than internal resource limits",
+      "description": "The order service shows elevated latency and errors while CPU usage is comparatively low (38%). This pattern is consistent with the possibility that the degradation originates from an external dependency or downstream call rather than from local CPU saturation. Logs provide more specific support: order-service errors report a downstream payment-service request timeout, and payment-service logs report a request exceeding the upstream timeout deadline. Additionally, payment-service is itself degraded with an elevated error rate (18%) and higher p95 latency (4800ms) than order-service. These observations are consistent with a dependency-facing timeout contributing to order-service latency and errors, but they do not establish whether payment-service slowness is itself the root cause or whether the order service timed out for other reasons. The causal direction remains directional rather than proven.",
+      "status": "supported",
+      "confidence": 0.6,
       "evidence": [
         {
           "evidence_id": "ev-001",
-          "relation": "supports",
-          "reason": "Shows order-service degraded with connection_pool_usage at 91%, error_rate at 10%, and p95_latency_ms=3200 while cpu_usage is 38%, a pattern consistent with dependency-related connection pool pressure, though it does not identify the dependency or pool or prove exhaustion or causation."
+          "relation": "neutral",
+          "reason": "The metrics show order-service is degraded with elevated latency and errors but low CPU usage (38%). This is consistent with, but does not demonstrate, a dependency-driven cause; no dependency identity, trace, or downstream metric is provided in this item to confirm the mechanism."
         },
         {
           "evidence_id": "ev-002",
           "relation": "supports",
-          "reason": "Logs show order-service requests to payment-service timing out and payment-service reporting requests exceeding an upstream timeout deadline, indicating a slow or unresponsive downstream dependency is involved and consistent with connections being held longer."
+          "reason": "Logs at the same timestamp show order-service reporting a downstream payment-service request timeout and payment-service reporting a request that exceeded the upstream timeout deadline. This directly names a downstream dependency in the timeout errors, supporting the possibility that a dependency-facing timeout contributes to order-service latency and errors, though it does not by itself prove the ultimate root cause."
+        },
+        {
+          "evidence_id": "ev-003",
+          "relation": "supports",
+          "reason": "Payment-service is reported degraded with error_rate=18% and p95_latency_ms=4800ms, which is consistent with the named downstream dependency itself experiencing degradation that could contribute to order-service timeouts and errors. This is a further hypothesis-consistent observation, but temporal correlation and the metrics do not prove that payment-service degradation is the root cause."
         }
       ]
     }
   ],
   "observed_facts": [
-    "order-service status=degraded, connection_pool_usage=91%, cpu_usage=38%, error_rate=10%, p95_latency_ms=3200ms at 2026-10-15T10:20:00Z.",
-    "Log at 2026-10-15T10:20:01Z: ERROR service=order-service downstream payment-service request timeout.",
-    "Log at 2026-10-15T10:20:02Z: ERROR service=payment-service payment request exceeded upstream timeout deadline.",
-    "payment-service status=degraded, cpu_usage=40%, error_rate=18%, p95_latency_ms=4800ms at 2026-10-15T10:20:00Z."
+    "order-service status=degraded at 2026-10-15T10:20:00Z with connection_pool_usage=91%, cpu_usage=38%, error_rate=10%, p95_latency_ms=3200ms.",
+    "Log 2026-10-15T10:20:01Z: order-service ERROR 'downstream payment-service request timeout'.",
+    "Log 2026-10-15T10:20:02Z: payment-service ERROR 'payment request exceeded upstream timeout deadline'.",
+    "payment-service status=degraded at 2026-10-15T10:20:00Z with cpu_usage=40%, error_rate=18%, p95_latency_ms=4800ms."
   ],
   "supporting_evidence": [
-    "Order-service errors explicitly name downstream payment-service request timeouts, establishing a failing order-to-payment call path.",
-    "payment-service is itself degraded with the highest latency (4800ms) and error rate (18%) among observed services.",
-    "Order-service latency (3200ms) is elevated alongside 91% connection pool usage and low CPU (38%), consistent with blocked outbound calls rather than local compute saturation."
+    "order-service error logs explicitly name payment-service as the downstream dependency timing out.",
+    "payment-service's own logs confirm requests exceeding the upstream timeout deadline at the same timestamp.",
+    "payment-service metrics show it is degraded with higher latency (4800ms) and error rate (18%) than order-service, temporally correlating with the order-service degradation.",
+    "Low CPU on both services (38%, 40%) is consistent with wait-on-dependency latency rather than local CPU saturation."
   ],
   "refuting_evidence": [
-    "No distributed trace or metric directly proving order-service latency is caused by payment-service rather than co-occurring.",
-    "No evidence identifying what specifically degrades payment-service (its own internal cause is unknown)."
+    "Neither service shows CPU saturation, so a purely CPU-bound root cause is not supported.",
+    "No metrics or logs were collected for any dependency of payment-service, so nothing rules out payment-service being a downstream victim rather than the root cause."
   ],
   "unverified_issues": [
-    "Which connection pool is saturated (order-service outbound vs. a database pool) and whether it is truly exhausted versus merely highly utilized.",
-    "Whether payment-service is the sole driver of order-service degradation or one of several contributing dependencies.",
-    "The root cause internal to payment-service (e.g., its own downstream dependency or database).",
-    "Causal direction and magnitude of impact between order-service and payment-service are inferred, not proven by tracing."
+    "Whether payment-service is the ultimate root cause or itself failing due to a further downstream dependency.",
+    "What resource the order-service connection pool (91%) connects to, and whether it is exhausted or causally linked to the latency/errors.",
+    "The exact mechanism and causal direction of the timeouts (config/timeout thresholds vs. genuine payment-service slowness).",
+    "Whether a shared infrastructure/network factor affects both services."
   ],
   "confidence": "medium",
   "next_steps": [
-    "Inspect distributed traces for order-service -\u003e payment-service spans to confirm the timeout dominates order-service latency and errors.",
-    "Query metrics and logs for payment-service's own downstream dependencies (e.g., its database) to find the origin of its degradation.",
-    "Collect connection pool details (pool name, active/max connections, acquisition wait time) for order-service to verify exhaustion versus high utilization.",
-    "Correlate error-rate and latency time series across order-service and payment-service to establish leading/lagging causal ordering."
+    "Query payment-service logs and traces for its own downstream calls to determine if it is a victim of a further dependency.",
+    "Inspect payment-service resource metrics (pool usage, DB latency) to test internal saturation.",
+    "Examine distributed traces from order-service to payment-service to confirm where time is spent and the true failure origin.",
+    "Identify the resource backing the order-service connection pool (91%) to test the connection pool saturation hypothesis."
   ],
   "knowledge": [
     {

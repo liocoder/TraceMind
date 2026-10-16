@@ -2,31 +2,12 @@
 Mock dataset: D:\code\tracemind\evals\datasets\observations.json
 Mock scenario: conflicting_signals
 
-[TraceMind] tool=load_skill arguments={"name": "connection_pool"}
-[TraceMind] result=# 连接池耗尽导致请求超时
-
-## 典型表现
-
-- 数据库连接池的活跃连接数持续接近最大连接数。
-- 等待连接的请求增加，获取连接的耗时升高。
-- 业务接口出现超时，但不一定意味着数据库本身已经发生故障。
-
-## 调查步骤
-
-1. 查询连接池活跃连接数、空闲连接数、等待连接数及连接获取耗时。
-2. 搜索连接获取超时、连接泄漏、连接未及时释放等日志。
-3. 对比业务请求量、数据库查询延迟与连接池指标的时间变化。
-4. 如果连接池指标正常，应继续排查下游依赖、慢查询或其他资源瓶颈。
-
-## 判断原则
-
-连接池耗尽是候选原因，不是看到接口超时后就能确认的根因。
-
-只有当前事故的观测数据支持这一解释时，才能提高该假设的可信度。
-[TraceMind] skill loaded="connection_pool"
+[TraceMind] tool=search_logs arguments={"query": "connection pool exhaustion active_connections acquire timeout 连接池耗尽"}
+[TraceMind] result=2026-10-15T11:10:01Z ERROR service=order-service connection pool exhausted
+2026-10-15T11:10:02Z ERROR service=order-service request timeout reported by one application instance
 [TraceMind] tool=query_metrics arguments={"service": "order-service"}
 [TraceMind] result=service=order-service, timestamp=2026-10-15T11:10:00Z, status=healthy, connection_pool_usage=30%, cpu_usage=25%, error_rate=0.2%, p95_latency_ms=180ms
-[TraceMind] tool=search_logs arguments={"query": "order service connection pool exhaustion"}
+[TraceMind] tool=search_logs arguments={"query": "order-service instance pod host datasource pool name recovered normal pool timeout 11:10"}
 [TraceMind] result=2026-10-15T11:10:01Z ERROR service=order-service connection pool exhausted
 2026-10-15T11:10:02Z ERROR service=order-service request timeout reported by one application instance
 {
@@ -47,119 +28,160 @@ Mock scenario: conflicting_signals
     "completed"
   ],
   "tool_calls": 3,
-  "summary": "The order service logs report 'connection pool exhausted' at 2026-10-15T11:10:01Z, immediately followed at 11:10:02Z by a 'request timeout reported by one application instance' error. However, the order-service metrics snapshot at 2026-10-15T11:10:00Z shows healthy status, connection_pool_usage=30%, cpu_usage=25%, error_rate=0.2%, p95_latency_ms=180ms. The connection_pool skill explicitly notes that connection pool exhaustion is a candidate cause, not a confirmed root cause, and that if pool metrics are healthy the investigation should continue toward downstream dependencies, slow queries, or other resource bottlenecks. The two log lines are approximately coincident with the metric timestamp, but the single aggregate metric sample is insufficient to confirm or refute genuine exhaustion — the exhaustion could be localized to one instance or transient, or the log message could be misleading. The root cause remains unconfirmed.",
+  "summary": "The order-service logs at 2026-10-15T11:10:01–11:10:02Z record a 'connection pool exhausted' error followed by a 'request timeout reported by one application instance' error. At nearly the same time (2026-10-15T11:10:00Z), service-level metrics for order-service report status=healthy, connection_pool_usage=30%, cpu_usage=25%, error_rate=0.2%, and p95_latency_ms=180ms. The core discrepancy is therefore confirmed as fact: an exhaustion event is logged while aggregate metrics appear healthy. However, the logs do not identify which instance, pod/host, or specific connection pool/resource logged the exhaustion, nor its duration, and the metrics do not reveal their aggregation window, sampling interval, or coverage scope. The most plausible and best-supported hypothesis is that the exhaustion was confined to a single application instance (or a specific pool) that service-level aggregate metrics do not surface — this is supported by the log wording 'reported by one application instance' plus the healthy aggregate usage figure, but it is NOT confirmed. Alternative explanations — a transient event too short for the metric granularity, or metrics that do not actually measure the affected pool — remain equally unverified. No root cause is confirmed; evidence is insufficient to distinguish among these hypotheses.",
   "hypotheses": [
-    "Log-reported pool exhaustion reflects per-instance or transient saturation (e.g., one application instance) that is not visible in service-level aggregated metrics.",
-    "Log pool-exhaustion entries are misleading, stale, or refer to a different connection resource than the metric measures, so no real exhaustion occurred.",
-    "The request timeout is caused by a downstream dependency, slow query, or another resource bottleneck (not the order service's own pool), which the exhaustion log text does not actually establish."
+    "Connection pool exhaustion was confined to a single application instance, so instance-scoped saturation is averaged out in service-level metrics (best-supported, unconfirmed).",
+    "The exhaustion was transient/short-lived and fell outside or between the metric aggregation windows and sampling intervals.",
+    "The healthy 'connection_pool_usage' metric does not cover the specific pool/resource that logged exhaustion (instrumentation gap, different scope, or mislabeled metric)."
   ],
   "evidence": [
     {
       "id": "ev-001",
-      "source": "metrics-provider",
-      "content": "service=order-service, timestamp=2026-10-15T11:10:00Z, status=healthy, connection_pool_usage=30%, cpu_usage=25%, error_rate=0.2%, p95_latency_ms=180ms",
-      "created_at": "2026-10-16T05:30:12.7922343Z"
+      "source": "logs-provider",
+      "content": "2026-10-15T11:10:01Z ERROR service=order-service connection pool exhausted\n2026-10-15T11:10:02Z ERROR service=order-service request timeout reported by one application instance",
+      "created_at": "2026-10-16T12:10:08.776373Z"
     },
     {
       "id": "ev-002",
+      "source": "metrics-provider",
+      "content": "service=order-service, timestamp=2026-10-15T11:10:00Z, status=healthy, connection_pool_usage=30%, cpu_usage=25%, error_rate=0.2%, p95_latency_ms=180ms",
+      "created_at": "2026-10-16T12:10:15.099148Z"
+    },
+    {
+      "id": "ev-003",
       "source": "logs-provider",
       "content": "2026-10-15T11:10:01Z ERROR service=order-service connection pool exhausted\n2026-10-15T11:10:02Z ERROR service=order-service request timeout reported by one application instance",
-      "created_at": "2026-10-16T05:30:19.178397Z"
+      "created_at": "2026-10-16T12:10:23.1236778Z"
     }
   ],
   "plans": [
     {
-      "tool_name": "load_skill",
-      "rationale": "The connection_pool skill summary is directly relevant to the reported pool exhaustion, but its detailed L2 content may specify what metrics and log patterns to inspect to resolve the healthy-metrics-vs-log-discrepancy. Loading it will guide more targeted metric and log queries.",
-      "expected_observation": "Detailed diagnostic steps, specific metrics (e.g., pool wait time, active connections) and log signatures to check for connection pool issues."
+      "tool_name": "search_logs",
+      "rationale": "The incident reports connection pool exhaustion in logs but healthy metrics. First we need the actual log evidence to see the exact errors, timestamps, and which service/connection pool is affected, so we can form testable hypotheses rather than assuming a cause.",
+      "expected_observation": "Log lines showing connection pool exhaustion errors (e.g., 'connection acquire timeout', 'pool exhausted'), the affected service or datasource, and timing to compare against metrics."
     },
     {
       "tool_name": "query_metrics",
-      "rationale": "The reported discrepancy is between logs claiming connection pool exhaustion and healthy-looking metrics. Querying the order service metrics will provide concrete connection pool and resource observations to either support or refute the pool exhaustion hypothesis and guide further investigation.",
-      "expected_observation": "Observed order service metrics including connection pool active/idle/waiting counts and connection acquisition latency, to determine whether pool exhaustion is reflected in metrics or whether another bottleneck exists."
+      "rationale": "The central discrepancy is between logger-reported pool exhaustion and healthy metrics. Querying service metrics for order-service is the most direct way to distinguish whether metrics genuinely look healthy, whether they reflect per-instance saturation, or whether the affected pool is not instrumented.",
+      "target_hypothesis_id": "hyp-9b2e5c41",
+      "expected_observation": "Observed order-service connection pool/utilization metrics, their scope (service-level vs per-instance), metric names, and sampling intervals, to compare against the logged exhaustion event."
     },
     {
       "tool_name": "search_logs",
-      "rationale": "The incident is a discrepancy between logs reporting pool exhaustion and healthy aggregate metrics. The existing evidence only contains the metric snapshot ev-001; we have no actual log content, timestamps, or pool-exhaustion message details. Searching logs is necessary to determine whether the exhaustion reports are transient/localized (hyp-3f7a2b91) or misleading/stale/repeated (hyp-8c1d4e60), which the single aggregate metric cannot distinguish.",
-      "expected_observation": "Actual log entries around connection pool exhaustion: timestamps, affected instance/worker identifiers, connection-acquisition timeout or wait messages, repetition patterns, and whether the entries align with or fall outside the metric window at 2026-10-15T11:10:00Z."
+      "rationale": "The existing log evidence is a single aggregate error line that does not identify the instance, pool name, or timing details, leaving all three hypotheses unverified. A more targeted log search can distinguish instance-scoped exhaustion (hyp-4a1c9e2b) from a transient event (hyp-7d3f0a56) and from metrics covering the wrong pool (hyp-9b2e5c41) by looking for the affected instance identifier, the pool name/resource, concurrent errors from other instances, and any 'recovered' or 'normal' messages.",
+      "target_hypothesis_id": "hyp-4a1c9e2b",
+      "expected_observation": "Log lines containing an instance identifier or pod/host name tied to the pool-exhausted error, the specific connection pool name, whether other instances reported the same error, and the time span over which exhaustion persisted or recovered."
     }
   ],
   "diagnosis_hypotheses": [
     {
-      "id": "hyp-3f7a2b91",
-      "title": "Log-reported pool exhaustion may reflect per-instance or transient saturation not visible in aggregated metrics",
-      "description": "The order service logs report connection pool exhaustion while the metrics snapshot at 2026-10-15T11:10:00Z shows connection_pool_usage=30% and healthy status. One plausible explanation is that the exhaustion observed in logs is localized (e.g., a subset of instances, a specific worker, or a brief burst) or occurred at a time not covered by this single aggregated sample, so service-level metrics appear healthy while individual logs record saturation. This remains unverified: the evidence does not establish the pool's resource type, the scope of the metric, or the time alignment between logs and metrics.",
+      "id": "hyp-4a1c9e2b",
+      "title": "Connection pool exhaustion confined to a single instance",
+      "description": "The order service logged connection pool exhaustion and a request timeout originating from one application instance. Because the metrics are described as healthy at the service level, the saturation may be limited to a single instance rather than reflected in aggregate service-level metrics. This is plausible but not verified: the logs do not identify the pool type, do not clearly tie the exhaustion line to a specific instance, and the causal relationship between the exhaustion and the timeout is not established by the evidence.",
       "status": "proposed",
-      "confidence": 0.35,
+      "confidence": 0.3,
       "evidence": [
         {
           "evidence_id": "ev-001",
-          "relation": "neutral",
-          "reason": "The metric shows connection_pool_usage=30% with healthy status, which is consistent with healthy aggregate utilization but does not confirm or exclude localized or transient pool exhaustion reported in logs. It also gives a single timestamp, so it cannot rule out saturation at another time."
+          "relation": "supports",
+          "reason": "The log shows a connection pool exhausted error and a request timeout reported by one application instance, which is consistent with per-instance rather than service-wide pool exhaustion."
         },
         {
           "evidence_id": "ev-002",
           "relation": "supports",
-          "reason": "The log entry at 2026-10-15T11:10:01Z explicitly reports connection pool exhaustion and the following entry mentions a request timeout reported by one application instance. The second entry specifically names one application instance, which provides some support for the idea that observed exhaustion may be localized to a subset of instances rather than reflected in service-level aggregated metrics."
+          "reason": "Service-level metrics at nearly the same timestamp report connection_pool_usage=30% and status=healthy, which is consistent with an instance-scoped problem that aggregate metrics do not surface."
+        },
+        {
+          "evidence_id": "ev-003",
+          "relation": "supports",
+          "reason": "A duplicate copy of the same error log reinforces that the exhaustion and timeout were recorded, while still not identifying the specific instance or pool."
         }
       ]
     },
     {
-      "id": "hyp-8c1d4e60",
-      "title": "Log messages may be misattributed or reflect misleading pool-exhaustion entries rather than true exhaustion",
-      "description": "The discrepancy between logged connection pool exhaustion and healthy pool metrics may indicate that the log statements are inaccurate or misleading, for example stale, repeated, or emitted from code paths that report exhaustion without it actually occurring, or referring to a different connection resource than the one covered by the metric. The evidence only provides an aggregate healthy metric snapshot and a description of the logs; no log contents, sample messages, or correlation with the metric window are provided, so this alternative cannot be distinguished from genuine saturation.",
+      "id": "hyp-7d3f0a56",
+      "title": "Aggregate metrics mask a transient or short-lived pool exhaustion",
+      "description": "The logged exhaustion event may have been brief or occurred at a granularity not captured by the healthy metrics, so averaged or sampled metrics would not reflect it. The evidence does not include sampling intervals or sub-minute timing correlation, so this explanation remains speculative and cannot be confirmed from the supplied observations alone.",
+      "status": "proposed",
+      "confidence": 0.25,
+      "evidence": [
+        {
+          "evidence_id": "ev-001",
+          "relation": "supports",
+          "reason": "A timestamped exhaustion error and timeout exist while metrics are reported healthy, which is consistent with a short-lived event that aggregate metrics did not capture."
+        },
+        {
+          "evidence_id": "ev-002",
+          "relation": "neutral",
+          "reason": "The healthy snapshot is taken at 11:10:00Z, one second before the logged exhaustion, but the metric's aggregation window and sampling interval are unknown, so it neither confirms nor refutes a transient event."
+        },
+        {
+          "evidence_id": "ev-003",
+          "relation": "neutral",
+          "reason": "The repeated exhaustion log is at the same second-level timestamp, providing no additional timing resolution to confirm or refute a transient event."
+        }
+      ]
+    },
+    {
+      "id": "hyp-9b2e5c41",
+      "title": "Misleading or misconfigured metrics for the affected pool",
+      "description": "The healthy metrics may not actually measure the connection pool that logged exhaustion, for example due to instrumentation gaps, a different scope or resource, or mislabeled metrics. The supplied evidence contains no metric names, scopes, or instrumentation details, so this hypothesis is a possible explanation for the discrepancy but is unverified. The metric field is named connection_pool_usage, but the evidence does not establish which pool or resource it covers.",
       "status": "proposed",
       "confidence": 0.25,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "neutral",
-          "reason": "A healthy service state with connection_pool_usage=30% is consistent with the absence of pool exhaustion at that moment, which could support the possibility that the log reports do not reflect actual exhaustion, but a single snapshot cannot validate the logs as misleading."
+          "reason": "The log records connection pool exhaustion despite healthy metrics; this discrepancy is consistent with, but does not demonstrate, metrics that do not cover the affected pool."
         },
         {
           "evidence_id": "ev-002",
           "relation": "neutral",
-          "reason": "The log entry states connection pool exhaustion but provides no stack trace, resource identifier, or counter to confirm that a real pool was exhausted. The same log line also reports a request timeout, which could be produced by unrelated conditions, so the log content alone does not establish that the exhaustion message is genuine."
+          "reason": "A reported connection_pool_usage=30% alongside a healthy status could reflect a pool, scope, or resource different from the one that logged exhaustion, but the evidence does not identify the metric's coverage."
+        },
+        {
+          "evidence_id": "ev-003",
+          "relation": "neutral",
+          "reason": "The duplicate error log confirms the exhaustion event occurred but supplies no metric scope or instrumentation detail to clarify what the healthy metrics measure."
         }
       ]
     }
   ],
   "observed_facts": [
-    "order-service metrics at 2026-10-15T11:10:00Z: status=healthy, connection_pool_usage=30%, cpu_usage=25%, error_rate=0.2%, p95_latency_ms=180ms.",
-    "Log entry 2026-10-15T11:10:01Z ERROR service=order-service 'connection pool exhausted'.",
-    "Log entry 2026-10-15T11:10:02Z ERROR service=order-service 'request timeout reported by one application instance'.",
-    "The metric snapshot timestamp (11:10:00Z) is approximately coincident with the log errors (11:10:01Z–11:10:02Z)."
+    "2026-10-15T11:10:01Z ERROR service=order-service connection pool exhausted.",
+    "2026-10-15T11:10:02Z ERROR service=order-service request timeout reported by one application instance.",
+    "2026-10-15T11:10:00Z metrics for order-service: status=healthy, connection_pool_usage=30%, cpu_usage=25%, error_rate=0.2%, p95_latency_ms=180ms.",
+    "The two error log lines were returned again on a second, broader log search with no additional instance, pod, host, or pool-name detail."
   ],
   "supporting_evidence": [
-    "Log explicitly reports connection pool exhaustion and a subsequent request timeout within the same second.",
-    "The timeout log names 'one application instance', consistent with a localized rather than fleet-wide condition, which would explain healthy service-level aggregate metrics."
+    "The log explicitly says the timeout was 'reported by one application instance', which is consistent with instance-scoped rather than service-wide exhaustion.",
+    "Service-level metrics at nearly the same timestamp show connection_pool_usage=30% and status=healthy, consistent with an instance- or pool-scoped problem that aggregate metrics would not surface.",
+    "The metric value (connection_pool_usage=30%) is well below saturation, indicating the service-level aggregate pool is healthy while a local event was logged."
   ],
   "refuting_evidence": [
-    "connection_pool_usage=30%, well below typical saturation, with status=healthy at the time of the errors.",
-    "cpu_usage=25%, error_rate=0.2%, and p95_latency_ms=180ms are all consistent with a healthy service, contradicting widespread pool exhaustion.",
-    "No stack trace, resource identifier, or connection counter in the logs confirms that a real pool was actually exhausted."
+    "No log line ties the exhaustion to a specific instance, pod, host, or pool name, so the 'single instance' scope is inferred from the timeout wording only, not directly shown for the exhaustion line itself.",
+    "The metrics are healthy at a timestamp one second before the exhaustion log, and the metric aggregation window/sampling interval is unknown, so the timing does not establish that metrics missed a localized event.",
+    "No evidence identifies which pool or resource the 'connection_pool_usage' metric measures, so it could refer to a different pool than the one that logged exhaustion."
   ],
   "unverified_issues": [
-    "The scope of the metric is unclear (service-level aggregate vs. per-instance), so localized saturation cannot be ruled in or out.",
-    "Only a single metric sample at one timestamp was obtained; no time-series trend of pool usage around the incident.",
-    "The logs provide no evidence of the pool's resource type (e.g., DB vs. HTTP client) or whether the exhaustion message is genuine.",
-    "Whether a downstream dependency, slow query, or other resource bottleneck is the actual driver of the request timeout."
+    "Which specific instance/pod/host emitted the connection pool exhausted error.",
+    "The name/type of the connection pool (e.g., database, HTTP client, downstream dependency) that was exhausted.",
+    "Whether the exhaustion was transient, sustained, or recovered, and its duration.",
+    "The metric aggregation window, sampling interval, and the exact scope/resource that 'connection_pool_usage' covers.",
+    "Whether the logged exhaustion and the request timeout share a common cause or are coincidental.",
+    "Any downstream dependency state at the time (only order-service was inspected)."
   ],
   "confidence": "low",
   "next_steps": [
-    "Query per-instance connection pool metrics (active/idle/waiting counts and connection acquisition latency) to detect localized saturation.",
-    "Retrieve the time series of connection_pool_usage across the incident window instead of a single sample.",
-    "Inspect full log context for the exhaustion entries (stack traces, instance IDs, connection resources) and check for repetition patterns.",
-    "Correlate the timeout with database query latency and downstream dependency metrics to test whether the pool is truly the bottleneck."
+    "Retrieve per-instance (pod/host-labeled) metrics for order-service connection pool usage and utilization to check whether one instance was saturated while the service aggregate stayed at ~30%.",
+    "Search logs with the exact pool/datasource name or error class, and any 'recovered'/'pool restored' messages, to determine the pool identity, affected instance, and event duration.",
+    "Confirm the instrumentation scope of 'connection_pool_usage' (which pool/resource it measures) and its sampling interval to test whether the event was transient or uncovered.",
+    "Correlate the 11:10:00–11:10:02Z window with instance-level error/timeout logs across all order-service replicas to see if only one instance was affected."
   ],
   "knowledge": [
     {
       "name": "connection_pool",
       "level": "summary"
-    },
-    {
-      "name": "connection_pool",
-      "level": "full"
     }
   ]
 }

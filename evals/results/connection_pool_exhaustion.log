@@ -4,7 +4,7 @@ Mock scenario: connection_pool_exhaustion
 
 [TraceMind] tool=query_metrics arguments={"service": "order-service"}
 [TraceMind] result=service=order-service, timestamp=2026-10-15T10:00:00Z, status=degraded, connection_pool_usage=98%, cpu_usage=42%, error_rate=8.5%, p95_latency_ms=1850ms
-[TraceMind] tool=search_logs arguments={"query": "order-service connection pool exhaustion timeout acquiring connection 502"}
+[TraceMind] tool=search_logs arguments={"query": "order-service connection pool exhausted timeout 502 downstream payment-service"}
 [TraceMind] result=2026-10-15T10:00:01Z ERROR service=order-service request timeout while acquiring database connection
 2026-10-15T10:00:03Z ERROR service=order-service connection pool exhausted
 [TraceMind] tool=load_skill arguments={"name": "connection_pool"}
@@ -47,97 +47,116 @@ Mock scenario: connection_pool_exhaustion
     "completed"
   ],
   "tool_calls": 3,
-  "summary": "The order-service is degraded (status=degraded) with connection_pool_usage=98%, error_rate=8.5%, and p95_latency_ms=1850ms. Logs directly show 'request timeout while acquiring database connection' and 'connection pool exhausted'. These observations support connection pool exhaustion as the leading explanation for the elevated latency and HTTP 502s. However, the underlying trigger (pool leak, pool size misconfiguration, or a slow database causing connections to be held longer) is not established, and CPU at 42% does not indicate CPU saturation.",
+  "summary": "The order-service is degraded with connection_pool_usage=98%, elevated p95 latency (1850ms), an 8.5% error rate including HTTP 502 responses, and moderate CPU (42%). Logs explicitly show 'request timeout while acquiring database connection' and 'connection pool exhausted' within order-service, directly linking database connection-acquisition failures to the observed latency and errors. This strongly supports database connection pool saturation as the proximate (intermediate) cause of the incident. However, the underlying driver of the saturation (connection leak, unclosed connections, traffic surge, or slow database queries holding connections) has not been established, and no downstream dependency evidence was collected. Root cause of the exhaustion remains unconfirmed.",
   "hypotheses": [
-    "Connection pool exhaustion at the order-service causes requests to wait for or fail to acquire a database connection, producing elevated latency and 502 responses.",
-    "A downstream database slowdown (slow queries, lock waits) holds connections longer, indirectly exhausting the pool.",
-    "A connection leak (connections not released back to the pool) gradually exhausts the pool.",
-    "Pool size is misconfigured too small for current request load."
+    "Database connection pool exhaustion causes request timeouts and HTTP 502 responses at order-service (proximate cause, strongly supported).",
+    "The pool saturation is driven by slow database queries or lock waits holding connections longer than normal.",
+    "The pool saturation is driven by a connection leak or connections not being released promptly.",
+    "The pool saturation is driven by a sudden increase in request volume against a fixed pool size.",
+    "An unidentified downstream dependency is involved in generating the 502 responses (not supported by available evidence)."
   ],
   "evidence": [
     {
       "id": "ev-001",
       "source": "metrics-provider",
       "content": "service=order-service, timestamp=2026-10-15T10:00:00Z, status=degraded, connection_pool_usage=98%, cpu_usage=42%, error_rate=8.5%, p95_latency_ms=1850ms",
-      "created_at": "2026-10-16T05:27:28.5857126Z"
+      "created_at": "2026-10-16T12:07:29.0412939Z"
     },
     {
       "id": "ev-002",
       "source": "logs-provider",
       "content": "2026-10-15T10:00:01Z ERROR service=order-service request timeout while acquiring database connection\n2026-10-15T10:00:03Z ERROR service=order-service connection pool exhausted",
-      "created_at": "2026-10-16T05:27:33.3912561Z"
+      "created_at": "2026-10-16T12:07:35.124226Z"
     }
   ],
   "plans": [
     {
       "tool_name": "query_metrics",
-      "rationale": "No observations have been collected yet. Querying service metrics for the order service is the most direct first step to characterize the latency and error behavior and identify which components are affected.",
-      "expected_observation": "P99 latency, 502 error rate, resource saturation (CPU/memory/connections), and downstream dependency health indicators for the order service."
+      "rationale": "No observations have been collected yet. Querying metrics for the order service is the most direct way to characterize the elevated P99 latency and 502 errors, and to identify whether the issue is resource saturation, dependency degradation, or error-rate related before forming hypotheses.",
+      "expected_observation": "Observed metrics for the order service such as latency percentiles, error rates, request throughput, CPU/memory usage, and dependency call latencies that can indicate the failure mode."
     },
     {
       "tool_name": "search_logs",
-      "rationale": "Metrics show high connection pool usage but cannot distinguish pool exhaustion/queueing from other causes of 502s and latency. Searching logs for connection acquisition failures, pool timeouts, or 502 error details provides direct evidence about whether the pool is actually exhausted and causing request failures.",
-      "target_hypothesis_id": "hyp-3a7f9c2e",
-      "expected_observation": "Log entries indicating connection pool exhaustion, inability to acquire a connection, connection acquisition timeouts, or 502-related exceptions tied to the order service."
+      "rationale": "The current evidence shows elevated connection pool usage, latency, and 502 errors, but does not distinguish between connection pool exhaustion (hyp-7f3a2c91) and a downstream dependency issue (hyp-1b9e4d02). Searching service logs for connection acquisition failures, timeouts, and downstream errors can reveal the actual error messages and distinguish which mechanism is active.",
+      "target_hypothesis_id": "hyp-7f3a2c91",
+      "expected_observation": "Log entries showing connection pool exhaustion/timeout errors (e.g., 'could not obtain connection', 'connection pool exhausted') or downstream call errors/timeouts that would clarify the source of 502s and latency."
     },
     {
       "tool_name": "load_skill",
-      "rationale": "The current hypotheses point to connection pool saturation, but the existing evidence only shows correlation and does not distinguish whether the root cause is a pool leak, pool size misconfiguration, or an upstream/downstream database slowdown. Loading the connection_pool skill provides the specific diagnostic signals (e.g., wait time, checkout duration, active vs idle connections, leak indicators) needed to guide the next metric/log queries and discriminate among competing root causes.",
-      "target_hypothesis_id": "hyp-3a7f9c2e",
-      "expected_observation": "Detailed investigation steps and diagnostic signals for connection pool exhaustion, including which metrics and log patterns differentiate pool leaks, size misconfiguration, and downstream database latency causes."
+      "rationale": "Evidence strongly supports connection pool saturation as an intermediate cause, but the root cause of saturation (leak, load increase, or slow queries) is unresolved. Loading the connection_pool skill will provide a structured checklist to identify the origin of saturation and distinguish it from a database latency or downstream dependency cause.",
+      "target_hypothesis_id": "hyp-7f3a2c91",
+      "expected_observation": "Detailed investigation guidance for connection pool exhaustion, including which additional metrics or log patterns to look for such as slow queries, connection leaks, pool size configuration, or abrupt traffic changes."
     }
   ],
   "diagnosis_hypotheses": [
     {
-      "id": "hyp-3a7f9c2e",
-      "title": "Connection pool saturation contributing to order-service latency and errors",
-      "description": "The order service is reported as degraded with connection_pool_usage of 98%, elevated error rate (8.5%), and p95 latency of 1850ms. Logs also show request timeouts while acquiring a database connection and an explicit 'connection pool exhausted' message. Together these observations are consistent with connection pool saturation causing requests to wait for or fail to acquire a connection, which could plausibly produce elevated P99 latency and HTTP 502 responses. However, this remains a correlation-based explanation: acquisition timeouts and exhaustion are reported by the same service logs, and the evidence does not establish metrics such as wait time, pool size, checkout duration, or whether a leak or upstream slowdown is the underlying cause. CPU usage at 42% does not support CPU saturation as the driver. The causal direction between pool exhaustion and downstream 502s is plausible but not independently traced.",
+      "id": "hyp-1b9e4d02",
+      "title": "Downstream dependency or external factor causing 502s and latency",
+      "description": "The order service shows HTTP 502 responses and elevated latency, which can occur when an intermediary or dependency fails to respond properly. However, logs explicitly report connection-acquisition timeouts and pool exhaustion inside order-service, and no evidence identifies a specific downstream dependency, its health, or origin of 502 responses. This remains a low-confidence alternative, less supported than in-service resource constraints.",
+      "status": "inconclusive",
+      "confidence": 0.15,
+      "evidence": [
+        {
+          "evidence_id": "ev-001",
+          "relation": "neutral",
+          "reason": "Reports error_rate=8.5% and degraded status including HTTP 502s, but provides no information about any specific downstream dependency, its health, or the origin of the 502 responses."
+        },
+        {
+          "evidence_id": "ev-002",
+          "relation": "refutes",
+          "reason": "Logs show request timeout while acquiring a database connection and connection pool exhausted within order-service, pointing to in-service resource contention rather than an unidentified downstream dependency or external factor."
+        }
+      ]
+    },
+    {
+      "id": "hyp-7f3a2c91",
+      "title": "Connection pool saturation contributing to latency and errors",
+      "description": "The order service is degraded with connection_pool_usage at 98%, elevated p95 latency (1850ms), and an 8.5% error rate. Logs add direct observations of request timeouts while acquiring a database connection and connection pool exhaustion. Together these are consistent with requests waiting for or failing to acquire connections, plausibly producing latency and errors including 502s. However, the evidence does not establish the root cause of the pool saturation (for example, a leak, increased load, or slow queries), and CPU usage is moderate at 42%, so saturation may be a symptom or intermediate cause rather than the ultimate origin.",
       "status": "supported",
-      "confidence": 0.6,
+      "confidence": 0.65,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "supports",
-          "reason": "Reports order-service degraded with connection_pool_usage=98%, error_rate=8.5%, and p95_latency_ms=1850ms, consistent with pool saturation correlating with latency and error elevation, though exhaustion and causation are not proven by this metric alone."
+          "reason": "Shows order-service degraded with connection_pool_usage=98%, p95_latency_ms=1850ms, and error_rate=8.5%, consistent with connection resource contention contributing to latency and errors."
         },
         {
           "evidence_id": "ev-002",
           "relation": "supports",
-          "reason": "Logs explicitly show 'request timeout while acquiring database connection' and 'connection pool exhausted' for order-service, directly indicating connection acquisition failures that align with the saturation hypothesis and could explain latency and 502 errors."
+          "reason": "Logs explicitly report request timeout while acquiring a database connection and connection pool exhausted for order-service, directly linking connection-acquisition failures to the observed degradation."
         }
       ]
     }
   ],
   "observed_facts": [
-    "query_metrics: service=order-service, status=degraded, connection_pool_usage=98%, cpu_usage=42%, error_rate=8.5%, p95_latency_ms=1850ms.",
-    "search_logs: '2026-10-15T10:00:01Z ERROR service=order-service request timeout while acquiring database connection'.",
-    "search_logs: '2026-10-15T10:00:03Z ERROR service=order-service connection pool exhausted'."
+    "Metrics at 2026-10-15T10:00:00Z: service=order-service, status=degraded, connection_pool_usage=98%, cpu_usage=42%, error_rate=8.5%, p95_latency_ms=1850ms.",
+    "Log at 2026-10-15T10:00:01Z: ERROR service=order-service 'request timeout while acquiring database connection'.",
+    "Log at 2026-10-15T10:00:03Z: ERROR service=order-service 'connection pool exhausted'.",
+    "CPU usage is moderate (42%), not saturated."
   ],
   "supporting_evidence": [
-    "connection_pool_usage=98% is near saturation.",
-    "Explicit log message 'connection pool exhausted' for order-service.",
-    "Explicit log message 'request timeout while acquiring database connection' for order-service.",
-    "Elevated error_rate (8.5%) consistent with requests failing (502) when connections cannot be acquired.",
-    "Elevated p95_latency (1850ms) consistent with requests waiting on connection acquisition."
+    "connection_pool_usage=98% indicates the database connection pool is nearly fully utilized.",
+    "Logs explicitly report 'connection pool exhausted' and 'request timeout while acquiring database connection' on order-service.",
+    "Elevated p95 latency (1850ms) and 8.5% error rate including 502s are consistent with requests queuing for or failing to acquire connections.",
+    "Moderate CPU suggests the bottleneck is connection/resource contention rather than CPU saturation."
   ],
   "refuting_evidence": [
-    "cpu_usage=42% does not support CPU saturation as an alternative cause.",
-    "No metrics on wait time, checkout duration, active vs idle connections, or pool size were collected to confirm exhaustion mechanics or rule out a leak/misconfiguration."
+    "No direct metric of waiting-connection count or connection-acquisition latency was collected to fully confirm queueing.",
+    "No downstream dependency metrics or traces were gathered, so a downstream contribution to the 502s cannot be excluded."
   ],
   "unverified_issues": [
-    "Whether the pool is truly exhausted due to a leak, undersizing, or a slow database holding connections.",
-    "Whether downstream database latency or slow queries contributed.",
-    "Whether any other downstream dependency is involved.",
-    "Direct causal trace linking pool exhaustion to the specific 502 responses.",
-    "Missing granular pool metrics: active/idle/waiting connection counts, connection acquisition time, pool max size."
+    "The ultimate root cause of pool saturation (leak, slow queries, traffic surge, or pool misconfiguration) is not identified.",
+    "No data on database query latency, lock waits, active/idle/waiting connection counts, or connection-acquisition duration.",
+    "No traffic/throughput comparison over time to rule in/out a load increase.",
+    "Whether the 502 responses originate solely from order-service or involve an intermediary/downstream is unverified."
   ],
   "confidence": "medium",
   "next_steps": [
-    "Query pool metrics: active vs idle connections, waiting count, connection acquisition/checkout duration.",
-    "Compare business request volume and database query latency over the same time window.",
-    "Search logs for connection leak or connection-not-released patterns.",
-    "Check database-side slow queries and lock waits.",
-    "Verify pool max size configuration against current load."
+    "Query connection pool detail metrics: active, idle, and waiting connection counts plus connection-acquisition latency.",
+    "Check database query latency and lock-wait metrics to test the slow-query hypothesis.",
+    "Review throughput/request-rate time series to test the traffic-surge hypothesis.",
+    "Search logs for connection leak or unclosed/not-released connection patterns.",
+    "Trace/inspect downstream dependency calls to confirm whether they contribute to the 502 responses."
   ],
   "knowledge": [
     {
@@ -145,11 +164,11 @@ Mock scenario: connection_pool_exhaustion
       "level": "summary"
     },
     {
-      "name": "database_latency",
+      "name": "downstream_timeout",
       "level": "summary"
     },
     {
-      "name": "downstream_timeout",
+      "name": "database_latency",
       "level": "summary"
     },
     {

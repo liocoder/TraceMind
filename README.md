@@ -8,17 +8,7 @@
 - **模型接口：** OpenAI-compatible Chat Completions，默认配置为 DeepSeek
 - **工具调用：** Function Calling、自定义 Tool Registry、MCP stdio 子集
 - **数据源：** 可插拔 `Provider` 接口，当前内置 JSON Mock Provider
-- **依赖：** `gopkg.in/yaml.v3`
 
-## 为什么做这个项目
-
-普通的工具调用 Demo 通常只展示“模型选择工具并返回结果”。TraceMind 更关注一个完整调查过程中的工程约束：
-
-1. **Agent 如何逐轮调查，而不是一次性生成答案？** 通过显式状态机和 Planner，将规划、执行、观测、假设评估与终局诊断串成闭环。
-2. **如何限制模型的行动范围？** Runtime 校验计划与工具调用的一致性，并施加单轮调用限制、总调用预算和超时控制。
-3. **如何区分现场证据与模型参考知识？** 日志、指标查询结果进入 Evidence Store；Skill 文档只作为参考上下文，不应被当作当前事故的观测事实。
-4. **如何控制不断增长的上下文？** 使用三级 Skill 加载和估算 token 预算，限制每次调查的上下文与工具成本。
-5. **如何验证改动是否有效？** 内置多种故障场景和单轮、关闭 Skill、完整 Agent 三种评测模式，为后续比较诊断质量与调用成本提供基础。
 
 ## 核心能力
 
@@ -39,17 +29,37 @@
 - 对模型评估结果施加确定性约束：当支持证据与反驳证据同时存在时，将状态校正为 `inconclusive`，并限制置信度。
 - 终局报告包含观察事实、支持证据、反驳证据、未验证事项、置信度与后续建议。
 
+证据与假设在调查闭环中的流转：
+
+```mermaid
+flowchart LR
+    Tool["工具执行<br/>指标 / 日志"] -->|现场观测| Evidence["Evidence Store<br/>ev-001, ev-002, ..."]
+    Skill["load_skill<br/>技能手册"] -.->|evidence=false<br/>不写入| Evidence
+    Evidence --> Evaluator["假设评估<br/>基于证据提出 / 更新候选根因"]
+    Evaluator --> Hypotheses["假设账本<br/>状态 · 置信度 · 证据引用"]
+    Hypotheses --> Planner["Planner<br/>选择能区分假设的下一步"]
+    Planner --> Tool
+    Evidence --> Report["终局报告<br/>结论 + 证据链"]
+    Hypotheses --> Report
+```
+
+**为什么这样设计？** 让结论从"模型生成的文本"变成"可回溯到证据 ID 的结构化判断"：
+
+- **证据是事实，假设是解释**：证据来自工具观测，程序可验证其存在与来源；假设是候选根因，必须引用真实证据，状态与置信度受确定性约束。
+- **三者各管一段**：程序校验引用合法性与状态规则，模型负责基于证据提出解释，评测负责检验最终结论。
+- **好处**：每条结论都能回溯到证据 ID，报告可审计；"应该查什么"（技能知识）与"已经观察到什么"（现场证据）在数据模型层隔离，互不污染。
+
 > 这些机制能够提高可追溯性和约束一致性，但不等于自动证明每个自然语言结论都被证据充分支持。当前评测中的证据质量检查主要验证引用合法性，语义级证据支持关系仍需进一步评估。
 
 ### 3. 渐进式 Skill 加载
 
 技能文档位于 `skills/`，采用带 front matter 的 Markdown 格式，并分为三个加载层级：
 
-| 层级 | 内容 | 加载方式 |
-| --- | --- | --- |
-| L1 | 技能名称、描述与触发词索引 | 常驻上下文 |
-| L2 | 命中技能的摘要与推荐工具 | 根据事故描述和观测触发词匹配 |
-| L3 | 完整排查手册 | 通过 `load_skill(name)` 按需加载 |
+| 层级  | 内容            | 加载方式                       |
+| --- | ------------- | -------------------------- |
+| L1  | 技能名称、描述与触发词索引 | 常驻上下文                      |
+| L2  | 命中技能的摘要与推荐工具  | 根据事故描述和观测触发词匹配             |
+| L3  | 完整排查手册        | 通过 `load_skill(name)` 按需加载 |
 
 `load_skill` 作为普通工具参与计划校验和工具调用预算。Skill 属于参考知识，不应作为现场证据写入 Evidence Store。技能匹配目前使用大小写不敏感的包含匹配，尚未实现语义检索或同义词扩展。
 
@@ -252,14 +262,14 @@ go vet ./...
 
 ## 配置说明
 
-| 配置项 | 默认值 | 说明 |
-| --- | --- | --- |
-| `llm.api_key` | 必填 | 建议只放在 `config.local.yaml` |
-| `llm.base_url` | `https://api.deepseek.com` | OpenAI-compatible API 地址 |
-| `llm.model` | `deepseek-chat` | 模型名称 |
-| `agent.max_tool_calls` | `3` | 单次调查允许的最大工具调用数 |
-| `agent.timeout_seconds` | `60` | 单次调查的超时时间，单位为秒 |
-| `agent.max_tokens` | `0` | 估算 Token 上限；小于等于 0 表示不启用 |
+| 配置项                     | 默认值                        | 说明                        |
+| ----------------------- | -------------------------- | ------------------------- |
+| `llm.api_key`           | 必填                         | 建议只放在 `config.local.yaml` |
+| `llm.base_url`          | `https://api.deepseek.com` | OpenAI-compatible API 地址  |
+| `llm.model`             | `deepseek-chat`            | 模型名称                      |
+| `agent.max_tool_calls`  | `3`                        | 单次调查允许的最大工具调用数            |
+| `agent.timeout_seconds` | `60`                       | 单次调查的超时时间，单位为秒            |
+| `agent.max_tokens`      | `0`                        | 估算 Token 上限；小于等于 0 表示不启用  |
 
 ## 场景与评测
 
@@ -267,18 +277,18 @@ go vet ./...
 
 `evals/datasets/observations.json` 包含 10 类 Mock 场景：
 
-| 场景 | 目标问题 |
-| --- | --- |
-| `connection_pool_exhaustion` | 连接池耗尽与请求超时 |
-| `cpu_spike` | CPU 飙升与服务退化 |
-| `downstream_timeout` | 下游依赖超时 |
-| `database_slow_query` | 数据库慢查询 |
-| `redis_latency` | Redis / 缓存延迟 |
-| `traffic_spike` | 流量突增与服务退化 |
-| `high_errors_normal_resources` | 资源正常但错误率升高 |
-| `conflicting_signals` | 日志与指标信号冲突 |
-| `insufficient_evidence` | 证据不足时应保留不确定性 |
-| `multiple_anomalies` | 多种异常同时出现 |
+| 场景                             | 目标问题         |
+| ------------------------------ | ------------ |
+| `connection_pool_exhaustion`   | 连接池耗尽与请求超时   |
+| `cpu_spike`                    | CPU 飙升与服务退化  |
+| `downstream_timeout`           | 下游依赖超时       |
+| `database_slow_query`          | 数据库慢查询       |
+| `redis_latency`                | Redis / 缓存延迟 |
+| `traffic_spike`                | 流量突增与服务退化    |
+| `high_errors_normal_resources` | 资源正常但错误率升高   |
+| `conflicting_signals`          | 日志与指标信号冲突    |
+| `insufficient_evidence`        | 证据不足时应保留不确定性 |
+| `multiple_anomalies`           | 多种异常同时出现     |
 
 ### 运行评测
 

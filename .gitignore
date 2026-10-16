@@ -1,2 +1,6 @@
-# Local secrets
+# IDEA / Goland
+.idea/
+*.iml
+
+# 本地私有配置（存放本地密钥、数据库密码）
 config.local.yaml
