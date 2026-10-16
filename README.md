@@ -1,165 +1,212 @@
 # TraceMind
 
-> 一个基于 Go 的**证据驱动（Evidence-Driven）故障诊断 Agent**：输入事故描述，Agent 在严格预算与计划约束下逐步调用工具收集证据，再让 LLM 在证据纪律约束下评估根因假设，最终输出可审计的结构化诊断报告。
+> **TraceMind 是一个基于 Go 实现的证据驱动故障诊断 Agent。** 给定事故描述后，Agent 会规划调查步骤、调用日志与指标工具、维护结构化根因假设，并输出带证据引用、反证和未验证事项的诊断报告。
 
-TraceMind 不依赖任何 Agent 框架，核心调查循环全部手写（约 4,400 行非测试 Go，唯一第三方依赖是 `yaml.v3`）。数据源通过 `Provider` 接口可插拔，工具层同时支持 Function Calling 与 [MCP](https://modelcontextprotocol.io) 两种暴露方式；参考知识采用**三级技能加载机制**（L1 索引 / L2 摘要 / L3 按需全量），并带可配置的 token 预算。
+项目重点不是简单地把 LLM 接上几个工具，而是围绕 Agent 应用工程中的几个关键问题实现可运行的机制：**多轮调查闭环、工具调用约束、证据与参考知识隔离、渐进式 Skill 加载、预算控制、MCP 工具暴露，以及可重复的场景评测**。
 
-## 特性
+- **语言：** Go 1.23
+- **模型接口：** OpenAI-compatible Chat Completions，默认配置为 DeepSeek
+- **工具调用：** Function Calling、自定义 Tool Registry、MCP stdio 子集
+- **数据源：** 可插拔 `Provider` 接口，当前内置 JSON Mock Provider
+- **依赖：** `gopkg.in/yaml.v3`
 
-- **证据驱动，杜绝编造**：所有结论必须基于工具真实返回的观测；LLM 评估假设时受 17 条证据纪律约束（区分观测与解读、禁止仅凭相关性断定因果、假设 ID 必须对应真实证据等）。**证据边界强制**：参考知识类工具（`load_skill`）声明 `evidence=false`，执行结果只作为模型可读的 tool 消息、不进入 Evidence Store，领域知识与现场观测在数据模型层隔离。
-- **调查纪律强制**：显式状态机（`pending → planning → executing → observing → completed/failed`）；单轮至多执行 1 个工具调用；模型只能调用当前计划允许的工具，违规调用整轮拒绝执行并补齐协议响应；工具调用失败同样计入预算；**取消与超时贯穿全链路**——Runtime 通过 `PlanContext(ctx)` 把整体取消信号直接传入规划器 LLM 请求。
-- **终局报告证据链结构化**：最终诊断除 `summary`/`hypotheses` 外，输出 `observed_facts` / `supporting_evidence` / `refuting_evidence` / `unverified_issues` / `confidence` / `next_steps`，把"每条结论 ← 哪些证据支持/反驳 ← 哪些未验证"从隐式文本变成显式结构，报告可读也可审计。
-- **预算控制**：单次调查有 `max_tool_calls` 预算（默认 3），预算耗尽后不再向模型暴露工具定义，强制只出最终诊断。
-- **LLM 调用韧性**：429/5xx/网络错误带指数退避重试（最多 2 次）；规划器输出异常（非法 JSON、幻觉工具名、空 rationale 等）**优雅降级**为强制终局而不是整场失败；假设评估失败保留上一轮结果继续调查；模型输出的非严格 JSON（Markdown 围栏、大写 `True`/`False`/`None`、尾逗号）在终局诊断、规划器、假设评估三处统一修复容错。
-- **结构化假设管理**：假设状态机（`proposed / supported / refuted / inconclusive`）、确定性约束校正（支持与反驳并存 → 强制 `inconclusive`）、证据引用完整性校验、基于标题哈希的稳定假设 ID。
-- **三级技能加载机制**：`skills/` 下的 Markdown 技能带结构化 front-matter（`name` / `description` / `triggers` / `recommended_tools`）。L1 技能索引常驻上下文；L2 按事故描述与证据命中触发词注入 2-3 条摘要；L3 由模型通过 `load_skill` 工具主动加载全文，受 `maxLoadedSkills=2` 容量 + LRU 淘汰约束。技能内容是参考知识，明确不作为当前事故证据。**加载状态、消息上下文与报告记录三者生命周期统一**：每轮用最新技能上下文整条替换旧消息（而非追加），被 LRU 淘汰技能的旧正文不会残留在对话历史中重复占用 token。
-- **Token 预算**：可配置 `max_tokens` 硬上限，基于轻量估算（ASCII ≈ 4 字符/token、CJK ≈ 1 字符/token）累计消息历史与工具定义；超限立即关闭调查并强制最终诊断，防止上下文失控。
-- **可插拔数据源**：`datasource.Provider` 接口（`QueryMetrics` / `SearchLogs`），内置基于 JSON 场景数据的 mock 实现，含服务名别名归一化、时间窗/指标名过滤、日志分词检索。
-- **MCP 能力**：手写 JSON-RPC 2.0 over stdio 最小协议子集（`initialize` / `ping` / `tools/list` / `tools/call` / `shutdown`），任意 MCP 客户端可连接，工具注册即自动暴露（含 `load_skill`）。
-- **可离线演示与评测**：内置 10 个故障场景数据集 + 评测用例 + 一键批量评测脚本（`evals/run.ps1`）。评分按四维合计 100：任务完成（20，正常结束）、根因质量（40，期望关键词命中、违禁词归零）、证据质量（20，结构化假设引用的证据 ID 必须真实存在）、工程效率（20，工具调用数在预算内）。支持三种模式对照：`full`（完整 TraceMind）、`no-skills`（关闭技能库）、`single-shot`（单轮 LLM 基线），用于消融实验证明各机制的净增益。
+## 为什么做这个项目
+
+普通的工具调用 Demo 通常只展示“模型选择工具并返回结果”。TraceMind 更关注一个完整调查过程中的工程约束：
+
+1. **Agent 如何逐轮调查，而不是一次性生成答案？** 通过显式状态机和 Planner，将规划、执行、观测、假设评估与终局诊断串成闭环。
+2. **如何限制模型的行动范围？** Runtime 校验计划与工具调用的一致性，并施加单轮调用限制、总调用预算和超时控制。
+3. **如何区分现场证据与模型参考知识？** 日志、指标查询结果进入 Evidence Store；Skill 文档只作为参考上下文，不应被当作当前事故的观测事实。
+4. **如何控制不断增长的上下文？** 使用三级 Skill 加载和估算 token 预算，限制每次调查的上下文与工具成本。
+5. **如何验证改动是否有效？** 内置多种故障场景和单轮、关闭 Skill、完整 Agent 三种评测模式，为后续比较诊断质量与调用成本提供基础。
+
+## 核心能力
+
+### 1. 多轮 Agent Runtime 与执行约束
+
+- 手写 Go Runtime，不依赖通用 Agent 框架。
+- 使用 `pending → planning → executing → observing → ... → completed/failed` 状态机记录调查生命周期。
+- Planner 负责提出下一步计划，Runtime 负责校验并执行，分离模型决策与工具执行。
+- 每轮最多执行一个工具调用；仅向模型暴露当前计划允许的工具。
+- 工具执行失败同样计入调用预算；预算耗尽后不再开放工具，要求模型基于已有信息生成终局报告。
+- 调查超时与 Context 取消信号传入规划器请求。
+
+### 2. Evidence Store 与结构化根因假设
+
+- 将日志、指标等工具返回的现场观测整理为可追溯 Evidence，并分配稳定的报告内证据 ID。
+- 使用 `proposed / supported / refuted / inconclusive` 管理根因假设状态。
+- 校验假设引用的证据 ID，拒绝引用不存在的证据。
+- 对模型评估结果施加确定性约束：当支持证据与反驳证据同时存在时，将状态校正为 `inconclusive`，并限制置信度。
+- 终局报告包含观察事实、支持证据、反驳证据、未验证事项、置信度与后续建议。
+
+> 这些机制能够提高可追溯性和约束一致性，但不等于自动证明每个自然语言结论都被证据充分支持。当前评测中的证据质量检查主要验证引用合法性，语义级证据支持关系仍需进一步评估。
+
+### 3. 渐进式 Skill 加载
+
+技能文档位于 `skills/`，采用带 front matter 的 Markdown 格式，并分为三个加载层级：
+
+| 层级 | 内容 | 加载方式 |
+| --- | --- | --- |
+| L1 | 技能名称、描述与触发词索引 | 常驻上下文 |
+| L2 | 命中技能的摘要与推荐工具 | 根据事故描述和观测触发词匹配 |
+| L3 | 完整排查手册 | 通过 `load_skill(name)` 按需加载 |
+
+`load_skill` 作为普通工具参与计划校验和工具调用预算。Skill 属于参考知识，不应作为现场证据写入 Evidence Store。技能匹配目前使用大小写不敏感的包含匹配，尚未实现语义检索或同义词扩展。
+
+### 4. LLM 调用韧性与预算治理
+
+- 对部分网络错误、HTTP 429 和 5xx 响应进行有限次数的指数退避重试。
+- 对规划输出异常提供降级路径；假设评估失败时尽量保留已有状态。
+- 对常见非严格 JSON 输出进行修复，包括 Markdown 代码围栏、大写布尔值/`None` 和尾随逗号。
+- 支持 `agent.max_tokens` 估算预算。估算器基于字符数近似计算，并非模型真实 tokenizer；超限时会尝试关闭工具调用并进入终局流程。
+
+### 5. MCP 工具服务
+
+项目实现了一个轻量的 MCP stdio 协议子集，支持 `initialize`、`notifications/initialized`、`ping`、`tools/list`、`tools/call` 和 `shutdown`。MCP 工具 Schema 由 Tool Registry 统一生成，避免 Function Calling 与 MCP 两套工具定义分叉。
+
+当前 MCP Server 是独立进程，提供本地 stdio 工具访问；它不共享 Agent Runtime 的单次调查预算，也未实现远程 HTTP transport 或认证机制。
 
 ## 架构
 
 ```mermaid
-flowchart TD
-    subgraph CMD["命令入口 cmd/"]
-        A[cmd/agent<br/>交互式调查主程序]
-        T[cmd/tool<br/>单轮工具决策演示]
-        L[cmd/toolloopcheck<br/>预算受限多轮演示]
-        M[cmd/mcp-server<br/>MCP stdio 服务]
-        S[cmd/llm<br/>对话冒烟测试]
+flowchart TB
+    User["用户输入事故描述"] --> Entry["cmd/agent"]
+    Eval["evals/run.ps1<br/>评测脚本"] --> Entry
+
+    subgraph Runtime["Agent Runtime · internal/agent"]
+        Loop["Runtime 状态机 / 调查循环"]
+        Planner["Planner<br/>生成下一步计划"]
+        Guard["计划校验与执行约束<br/>单轮调用 / 工具预算 / 超时"]
+        Context["上下文组装<br/>证据 / 假设 / Skills / Token 预算"]
+        Report["终局诊断报告"]
+        Loop --> Planner --> Guard --> Loop
+        Loop <--> Context
+        Loop --> Report
     end
 
-    subgraph CORE["调查内核 internal/agent"]
-        RT[Runtime 主循环与状态机]
-        PL[LLMPlanner 规划下一步]
-        EX[ExecuteToolCalls 执行与证据生成]
-        HE[hypothesis_evaluator 假设评估]
-        ES[evidence.Store 并发安全证据存储]
-        DM[diagnosis.Manager 假设管理]
-        SK[skills.Library 三级技能库]
-        TB[token 预算估算]
+    Entry --> Loop
+    Planner <--> LLM["internal/llm<br/>OpenAI-compatible API"]
+
+    subgraph Tools["工具与数据能力"]
+        Registry["internal/tool<br/>Tool Registry"]
+        Metrics["query_metrics"]
+        Logs["search_logs"]
+        SkillTool["load_skill"]
+        Registry --> Metrics
+        Registry --> Logs
+        Registry --> SkillTool
+        Metrics --> Provider["datasource.Provider"]
+        Logs --> Provider
+        Provider --> Mock["Mock JSON 场景数据"]
+        SkillTool --> SkillLib["internal/skills<br/>L1 索引 / L2 摘要 / L3 全文"]
+        SkillLib --> SkillFiles["skills/*.md"]
     end
 
-    subgraph SVC["能力层 internal/"]
-        LLM[llm.Client<br/>Chat Completions]
-        TK[tool.Registry<br/>search_logs / query_metrics / load_skill]
-        DS[datasource.Provider]
-        MP[mcp.Server<br/>JSON-RPC over stdio]
-    end
+    Guard --> Registry
+    Metrics --> Evidence["Evidence Store"]
+    Logs --> Evidence
+    Context <--> Evidence
+    Context <--> Hypotheses["diagnosis.Manager<br/>假设状态与证据引用校验"]
+    Loop --> Hypotheses
 
-    subgraph DATA["数据"]
-        OBS[observations.json<br/>10 个故障场景]
-        SKL[skills/*.md<br/>技能知识库]
-        CASES[cases.json<br/>评测用例]
-    end
+    MCPEntry["cmd/mcp-server"] --> MCP["internal/mcp<br/>JSON-RPC 2.0 over stdio"]
+    MCP --> Registry
 
-    A --> LLM
-    A --> RT
-    RT --> PL
-    RT --> EX
-    RT --> HE
-    RT --> SK
-    RT --> TB
-    HE --> ES
-    HE --> DM
-    EX --> ES
-    EX --> TK
-    TK --> DS
-    DS --> OBS
-    SK --> SKL
-    T --> LLM
-    L --> LLM
-    M --> MP
-    MP --> TK
-    MP --> DS
-    CASES -.-> A
+    Cases["evals/datasets/cases.json<br/>评测用例"] -.-> Eval
+    Scenarios["evals/datasets/observations.json<br/>故障场景"] --> Mock
 ```
 
-### 调查主循环
+### 一次调查如何运行
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant U as 用户
-    participant RT as Runtime
-    participant PL as LLMPlanner
-    participant LLM as LLM
-    participant TK as Tool Registry
-    participant DP as Mock Provider
-    participant ES as Evidence Store
-    participant DM as diagnosis.Manager
+    participant R as Runtime
+    participant P as Planner
+    participant L as LLM API
+    participant T as Tool Registry
+    participant D as Mock Provider / Skill Library
+    participant E as Evidence Store
+    participant H as Hypothesis Manager
 
-    U->>RT: 事故描述
-    RT->>RT: L1 技能索引 + L2 摘要注入（命中触发词）
-    RT->>PL: 规划下一步（CALL_TOOL / NO_ACTION）
-    PL-->>RT: 计划（tool_name + rationale + 技能摘要）
-    RT->>LLM: 仅暴露计划内工具定义
-    LLM-->>RT: 工具调用 或 最终 JSON
+    U->>R: 提交事故描述
+    R->>R: 初始化状态、预算与上下文
+    R->>P: 规划下一步调查
+    P->>L: 发送规划请求
+    L-->>P: 返回结构化计划
+    P-->>R: 工具计划或终止调查
+    R->>R: 校验计划并限制可用工具
+    R->>L: 发送当前允许的工具定义
+    L-->>R: 返回工具调用或终局诊断
 
-    alt 工具调用
-        RT->>TK: 执行（单轮至多 1 个）
-        TK->>DP: QueryMetrics / SearchLogs / LoadSkill
-        DP-->>TK: 观测结果
-        TK-->>RT: 结果
-        RT->>ES: 写入证据 ev-NNN
-        RT->>DM: 评估假设（17 条纪律 + 确定性约束）
-        RT->>RT: 状态 observing → planning；技能上下文随新证据刷新
-    else 最终诊断
-        RT->>RT: 校验 JSON → 状态 completed
-        RT-->>U: 结构化诊断报告
+    alt 执行工具
+        R->>T: 校验后执行一个工具
+        T->>D: 查询指标、日志或加载 Skill
+        D-->>T: 返回工具结果
+        T-->>R: 返回结果
+        alt 现场观测
+            R->>E: 保存观测证据
+            R->>H: 更新根因假设
+        else Skill 参考知识
+            R->>R: 仅作为工具上下文，不作为现场证据
+        end
+        R->>R: 更新状态并检查剩余预算
+    else 终局诊断
+        R->>R: 校验报告结构与证据引用
+        R-->>U: 返回结构化诊断报告
     end
 ```
 
-## 目录结构
+## 项目结构
 
-```
+```text
 TraceMind/
 ├── cmd/
-│   ├── agent/            # 交互式调查主程序（推荐入口，支持 -skills 指定技能目录）
-│   ├── mcp-server/       # MCP stdio 服务器，暴露工具层（含 load_skill）
-│   ├── tool/             # 单轮工具决策演示（只打印模型的决定，不执行）
-│   ├── toolloopcheck/    # 预算受限多轮工具循环演示
-│   └── llm/              # 最小对话冒烟测试
+│   ├── agent/             # Agent 交互式调查入口
+│   ├── mcp-server/        # MCP stdio 工具服务器
+│   ├── tool/              # 单轮工具决策演示
+│   ├── toolloopcheck/     # 多轮工具预算演示
+│   └── llm/               # LLM 连通性冒烟测试
 ├── internal/
-│   ├── agent/            # 调查运行时：主循环、状态机、规划器、工具执行、假设评估、
-│   │                     #   技能上下文组装、token 预算
-│   ├── skills/           # 三级技能库：front-matter 解析、触发词匹配、LRU 加载预算
-│   ├── config/           # YAML 配置加载（config.local.yaml 密钥覆盖）
-│   ├── datasource/       # Provider 接口与查询类型
-│   │   └── mock/         # 基于 JSON 场景数据的 mock 实现
-│   ├── diagnosis/        # 假设模型与并发安全管理器
-│   ├── evidence/         # 证据模型与并发安全存储
-│   ├── llm/              # OpenAI 兼容 Chat Completions 客户端
-│   ├── mcp/              # MCP 协议层（JSON-RPC 2.0 over stdio）
-│   └── tool/             # 工具接口、注册表与内置工具（含 load_skill）
+│   ├── agent/             # Runtime、Planner、工具执行、上下文与预算
+│   ├── config/            # YAML 配置与本地密钥覆盖
+│   ├── datasource/        # Provider 接口
+│   │   └── mock/          # JSON 场景数据源
+│   ├── diagnosis/         # 根因假设模型与管理器
+│   ├── evidence/          # 证据模型与存储
+│   ├── llm/               # OpenAI-compatible Chat Completions 客户端
+│   ├── mcp/               # MCP stdio 协议子集
+│   ├── skills/            # Skill 解析、匹配与加载管理
+│   └── tool/              # 工具接口、注册表与内置工具
 ├── evals/
-│   ├── datasets/         # observations.json（场景数据）、cases.json（评测用例）
-│   ├── run.ps1           # 一键批量评测脚本
-│   └── results/          # 评测结果示例（summary.json）
-├── skills/               # 技能知识库：Markdown 排查手册（front-matter + 正文）
-├── config.yaml           # 公开配置（不含密钥）
-└── go.mod                # Go 1.23，唯一依赖 yaml.v3
+│   ├── datasets/          # 故障观测数据与评测用例
+│   ├── results/           # 评测输出示例
+│   └── run.ps1            # 批量评测与基线对照
+├── skills/                # Markdown 排查手册
+├── config.yaml            # 不含密钥的基础配置
+└── go.mod
 ```
 
 ## 快速开始
 
 ### 环境要求
 
-- Go 1.23+
-- 任意 OpenAI 兼容 Chat Completions API（默认 [DeepSeek](https://platform.deepseek.com)，可通过 `base_url` / `model` 切换）
+- Go 1.23 或更高版本
+- 一个兼容 OpenAI Chat Completions API 的模型服务；默认配置为 DeepSeek
 
-### 1. 配置 API Key
+### 1. 配置模型 API Key
 
-`config.yaml` 是公开配置（可提交），密钥放在同目录 `config.local.yaml`（已被 `.gitignore` 排除），加载时会自动用本地文件覆盖 `llm.api_key`：
+在项目根目录创建 `config.local.yaml`。该文件用于覆盖本地密钥，不要提交到 Git：
 
 ```yaml
-# config.local.yaml
 llm:
-  api_key: "sk-..."
+  api_key: "替换成你的 API Key"
 ```
 
-### 2. 运行 Agent（交互式调查）
+`config.yaml` 中包含默认的 `base_url`、`model` 和 Agent 参数。需要更换模型时，可修改对应配置。
+
+### 2. 运行 Agent
 
 ```bash
 go run ./cmd/agent
@@ -167,55 +214,35 @@ go run ./cmd/agent
 
 输入事故描述，例如：
 
-```
-The order service frequently times out and returns HTTP 502.
+```text
+订单服务频繁超时，部分请求返回 HTTP 502
 ```
 
-也可以非交互运行，指定事故描述与场景：
+也可以直接传入事故描述和 Mock 场景：
 
 ```bash
-go run ./cmd/agent \
-  -incident "The order service frequently times out and returns HTTP 502." \
-  -scenario connection_pool_exhaustion
+go run ./cmd/agent -incident "订单服务频繁超时，部分请求返回 HTTP 502" -scenario connection_pool_exhaustion
 ```
 
-Agent 会在终端打印每轮的工具调用与结果，最后输出完整 JSON 诊断报告（`incident`、`state`、`state_history`、`tool_calls`、`summary`、`hypotheses`、`evidence`、`plans`、`diagnosis_hypotheses`、`knowledge`，以及终局证据链结构 `observed_facts` / `supporting_evidence` / `refuting_evidence` / `unverified_issues` / `confidence` / `next_steps`——`knowledge` 记录实际使用过的技能与加载级别）。
+当前场景数据由本地 Mock Provider 提供；模型仍需要可用的 API Key 和网络连接。
 
-### 3. 工具层演示
+### 3. 运行其他演示
 
 ```bash
-go run ./cmd/tool           # 单轮：模型决定调用哪个工具（不执行）
-go run ./cmd/toolloopcheck  # 多轮：预算受限循环，演示预算耗尽后强制终局
+go run ./cmd/tool
+go run ./cmd/toolloopcheck
+go run ./cmd/llm
 ```
 
-### 4. 运行 MCP Server
+### 4. 启动 MCP Server
 
 ```bash
 go run ./cmd/mcp-server -scenario connection_pool_exhaustion
 ```
 
-MCP Server **不需要 LLM 配置**（只执行工具）。它走 stdio 协议，`Serve()` 会阻塞等待 stdin 上的 JSON-RPC 消息——**在前台直接运行会一直“卡住”，这是设计行为**：它应当被 MCP 客户端拉起，或用管道喂消息验证：
+MCP Server 使用 stdio 通信，启动后会等待客户端通过标准输入发送协议消息，因此在终端前台运行时看起来不会主动退出，这是预期行为。它应由支持 stdio 的 MCP 客户端启动。
 
-```bash
-# 用管道喂一条 initialize 消息验证握手
-'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cli","version":"0.0.1"}}}' |
-  go run ./cmd/mcp-server -scenario connection_pool_exhaustion
-```
-
-接入任意 MCP 客户端，例如 Claude Desktop：
-
-```json
-{
-  "mcpServers": {
-    "tracemind": {
-      "command": "go",
-      "args": ["run", "./cmd/mcp-server", "-scenario", "connection_pool_exhaustion"]
-    }
-  }
-}
-```
-
-### 5. 验证
+### 5. 构建与测试
 
 ```bash
 go build ./...
@@ -223,191 +250,79 @@ go test ./...
 go vet ./...
 ```
 
-## 配置参考
+## 配置说明
 
-| 字段                      | 默认值                        | 说明                              |
-| ----------------------- | -------------------------- | ------------------------------- |
-| `llm.api_key`           | （必填）                       | 放在 `config.local.yaml`，不提交到 Git |
-| `llm.base_url`          | `https://api.deepseek.com` | OpenAI 兼容端点，自动去除尾部 `/`          |
-| `llm.model`             | `deepseek-chat`            | 模型名                             |
-| `agent.max_tool_calls`  | `3`                        | 单次事故调查的最大工具调用预算                 |
-| `agent.timeout_seconds` | `60`                       | 单次调查整体超时（秒）                     |
-| `agent.max_tokens`      | `0`                        | 单次调查的估算 token 硬上限；`<=0` 表示不启用 |
-
-## 数据集与评测
-
-### 故障场景（`evals/datasets/observations.json`）
-
-每个场景包含 `metrics[]`（服务健康指标快照）与 `logs[]`（结构化日志），供 mock Provider 读取。共 10 个场景：
-
-| 场景 ID                          | 说明                         |
-| ------------------------------ | -------------------------- |
-| `connection_pool_exhaustion`   | 连接池耗尽：订单服务 P99 升高、HTTP 502 |
-| `cpu_spike`                    | CPU 尖峰：服务变慢、错误率上升          |
-| `downstream_timeout`           | 下游依赖（payment-service）超时    |
-| `database_slow_query`          | 数据库慢查询                     |
-| `redis_latency`                | Redis / 缓存访问延迟             |
-| `traffic_spike`                | 流量尖峰导致网关与订单服务退化            |
-| `high_errors_normal_resources` | 高错误率但资源正常（业务校验类错误）         |
-| `conflicting_signals`          | 信号矛盾：日志称连接池耗尽但指标健康         |
-| `insufficient_evidence`        | 证据不足：模型应明确不确定性             |
-| `multiple_anomalies`           | 多异常叠加：CPU 与连接池同时升高         |
-
-### 评测用例（`evals/datasets/cases.json`）
-
-每个 case 声明事故描述、`expected_keywords`（诊断必须命中的关键词）、`forbidden_keywords`（诊断不得出现的错误结论）与 `expected_tool_calls_max`（预算上限），用于对 Agent 输出做断言式评测。评分按四维合计 100：
-
-| 维度 | 分值 | 判定 |
+| 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| 任务完成 | 20 | 正常结束（`state=completed`）且产出报告 |
-| 根因质量 | 40 | 命中任一期望关键词 +40；命中违禁词则该维度归零 |
-| 证据质量 | 20 | 结构化假设引用的 `evidence_id` 全部真实存在于报告证据列表；未输出结构化假设给中性分 |
-| 工程效率 | 20 | 工具调用数 ≤ 预算 +20，每超 1 扣 5，最低 0 |
+| `llm.api_key` | 必填 | 建议只放在 `config.local.yaml` |
+| `llm.base_url` | `https://api.deepseek.com` | OpenAI-compatible API 地址 |
+| `llm.model` | `deepseek-chat` | 模型名称 |
+| `agent.max_tool_calls` | `3` | 单次调查允许的最大工具调用数 |
+| `agent.timeout_seconds` | `60` | 单次调查的超时时间，单位为秒 |
+| `agent.max_tokens` | `0` | 估算 Token 上限；小于等于 0 表示不启用 |
 
-`evals/results/summary.json` 是示例运行结果（命中/四维得分/工具调用数/状态）。
+## 场景与评测
 
-在项目目录运行以下命令即可跑所有 case（会逐条调用真实 LLM，请先配置 API Key）：
+### 内置故障场景
 
-```
+`evals/datasets/observations.json` 包含 10 类 Mock 场景：
+
+| 场景 | 目标问题 |
+| --- | --- |
+| `connection_pool_exhaustion` | 连接池耗尽与请求超时 |
+| `cpu_spike` | CPU 飙升与服务退化 |
+| `downstream_timeout` | 下游依赖超时 |
+| `database_slow_query` | 数据库慢查询 |
+| `redis_latency` | Redis / 缓存延迟 |
+| `traffic_spike` | 流量突增与服务退化 |
+| `high_errors_normal_resources` | 资源正常但错误率升高 |
+| `conflicting_signals` | 日志与指标信号冲突 |
+| `insufficient_evidence` | 证据不足时应保留不确定性 |
+| `multiple_anomalies` | 多种异常同时出现 |
+
+### 运行评测
+
+在 Windows PowerShell 中执行：
+
+```powershell
 powershell -ExecutionPolicy Bypass -File .\evals\run.ps1
 ```
 
-**消融基线对照**（用于证明 Skill / 多轮调查机制的净增益）：
+脚本会逐条调用真实 LLM API，请先配置好 Key，并留意模型调用成本。支持三种模式：
 
-```
-powershell -ExecutionPolicy Bypass -File .\evals\run.ps1 -Mode no-skills    # 关闭技能库
-powershell -ExecutionPolicy Bypass -File .\evals\run.ps1 -Mode single-shot  # 单轮 LLM 基线
-```
+```powershell
+# 完整 Agent：Runtime + 工具 + Skills
+powershell -ExecutionPolicy Bypass -File .\evals\run.ps1 -Mode full
 
-非 `full` 模式的结果写入 `evals/results/<mode>/`，与完整模式隔离；对比三份 `summary.csv` 即可观察质量（根因命中）与成本（工具调用数）的差异。
+# 关闭 Skills，观察技能机制的影响
+powershell -ExecutionPolicy Bypass -File .\evals\run.ps1 -Mode no-skills
 
-脚本设置 `$ErrorActionPreference=Continue`：单个 case 的 stderr 输出（如部分报告、降级告警）不会中断评测，每个 case 都会先写入 `results/<case>.log` 再判定退出码，失败 case 计入 CSV/JSON 汇总后继续下一个。
-
-### 技能知识库（`skills/*.md`）
-
-技能取代了早期的被动 RAG 检索：不靠文本相似度“猜”相关文档，而是三层渐进式接入模型上下文。
-
-每个技能文件是一个带结构化 front-matter 的 Markdown 手册：
-
-```markdown
----
-name: connection_pool
-description: 排查数据库连接池耗尽导致的请求超时、连接获取失败与 502
-triggers: connection pool, connection_pool, 连接池, 连接耗尽
-recommended_tools: query_metrics, search_logs
----
-
-# 连接池耗尽导致请求超时
-
-## 调查步骤
-...
+# 单轮 LLM 基线，不进行多轮工具调查
+powershell -ExecutionPolicy Bypass -File .\evals\run.ps1 -Mode single-shot
 ```
 
-三级加载机制：
+评测用例通过 `expected_keywords`、`forbidden_keywords`、证据 ID 合法性、完成状态和工具调用预算进行断言式评分。它适合用于开发阶段的回归检查和基线对比，**不能将评分直接等同于真实世界的根因诊断准确率**。尤其是关键词命中不能完全代表语义正确，建议结合人工抽查与更多独立测试集评估。
 
-| 级别 | 触发方式 | 内容 | 成本 |
-| --- | --- | --- | --- |
-| L1 索引 | 常驻 | 所有技能的名字、描述、触发词一行一条 | 固定且极小 |
-| L2 摘要 | 事故描述/证据命中触发词 | 命中技能的描述 + 推荐工具（最多 3 条） | 小，随轮次刷新 |
-| L3 全量 | 模型调用 `load_skill(name)` | 完整排查步骤注入后续轮次 | 大，受预算约束 |
+## 设计取舍与已知限制
 
-L3 的约束：
+- **Mock 数据源：** 当前重点是 Agent 调查机制，尚未接入 Prometheus、OpenSearch 等真实可观测性系统。实现 `datasource.Provider` 即可替换数据源。
+- **Skill 匹配：** 使用触发词包含匹配，未实现向量检索、同义词扩展或模糊匹配。
+- **Token 估算：** 使用字符数近似值，不等同于模型 tokenizer 的真实 Token 数。
+- **上下文管理：** 当前有技能上下文更新和预算控制，但尚未实现完整的对话历史压缩；工具返回内容仍可能增加历史上下文成本。
+- **LLM 客户端：** 当前采用非流式 Chat Completions，重试策略较基础，尚未覆盖所有服务商的速率限制细节。
+- **MCP：** 仅实现本地 stdio 子集，不包含远程 HTTP transport、OAuth 或服务注册中心。
+- **评测：** 支持 `full`、`no-skills`、`single-shot` 对照，但尚未接入 CI；当前评分仍偏规则化，需要继续扩充语义级指标与人工评审。
+- **生产化：** 尚未提供真实数据源鉴权、租户隔离、审计持久化、并发任务调度等生产环境能力。
 
-- **容量上限**：`maxLoadedSkills = 2`，超出按 LRU 淘汰最早加载的技能。
-- **加载预算**：`load_skill` 是一个普通工具，同样受单轮单工具、计划强制与 `max_tool_calls` 预算约束。
-- **证据隔离**：技能内容属于参考知识，工具执行结果带 `evidence=false`，不进入当前事故的证据存储；系统提示与技能上下文均明确“技能不是当前事故的观测，禁止当作根因证明”。
+## Roadmap
 
-`internal/skills` 的 `Library.Match` 采用大小写不敏感的包含匹配，中英文触发词均可命中；`Library.Index()` 生成 L1 常驻清单。
-
-## 核心设计
-
-### 调查循环与状态机
-
-每次事故调查创建独立的证据存储与假设管理器。状态机：`pending → planning → executing → observing → … → completed/failed`，终态不可再迁移，完整迁移历史写入报告（`state_history`）。整体轮数上限为 `max_tool_calls + 4`（预算内的工具轮 + 收尾诊断轮）。
-
-### 规划器（LLM Planner）
-
-`LLMPlanner` 每轮单独调用 LLM 决策下一步，只返回 JSON 计划（`action: CALL_TOOL | NO_ACTION`、`tool_name`、`rationale`、`target_hypothesis_id`、`expected_observation`），**规划与执行分离**：模型只负责提计划，工具是否执行由 Runtime 校验。规划输入包含当前证据、假设列表、各工具已调用次数与技能摘要（L2/L3 命中项）；`NO_ACTION` 触发强制终局。`Planner` 是接口，可替换为规则规划器或离线策略；Runtime 通过 `PlanContext(ctx)` 调用，整体取消/超时信号直接贯穿规划请求。
-
-### 计划强制与预算
-
-- 每轮只向模型暴露计划内单个工具的定义，其余工具不可见。
-- 模型调用不符合计划 → 本轮全部调用拒绝执行，并为每个调用补齐协议响应，要求按计划或直接终局。
-- 单轮至多执行 1 个调用；**执行失败也计入预算**，防止失败重试绕过预算。
-- 预算耗尽后：不再提供工具定义、拒绝执行任何工具调用，只要求基于已有证据输出最终诊断。
-- **Token 预算**：每轮用轻量估算（ASCII ≈ 4 字符/token、CJK ≈ 1 字符/token）累计消息历史与工具定义；超过 `max_tokens` 时打印告警、清空工具定义并强制终局，若已处于终局态仍超限则直接失败。估算器是确定性近似，用于硬上限控制，不追求与具体分词器一致。
-- **异常降级**：规划器返回的模型输出错误（`ErrPlannerDegraded`）不会终止调查，而是打印告警并直接进入终局；假设评估失败时保留上一轮评估结果继续调查。配置类错误（无工具、客户端未配置等）仍会明确失败，避免掩盖真实问题。
-
-### 证据与假设评估
-
-工具结果先写入证据存储（ID 重编为 `ev-001` 起，重复 ID 拒绝，并发安全），再触发假设评估。**参考知识工具（`load_skill`）的结果被排除在证据生成之外**（`Metadata["evidence"]=="false"`）：它仍然以 tool 消息形式返回给模型，但不会进入 Evidence Store、不会触发假设评估，从数据模型层杜绝"应该查什么"被当成"已经观察到什么"。评估提示词含 17 条纪律，例如：观测不等于指令、高利用率不等于已耗尽、时间邻近不等于因果、`supported` 不代表因果已证实、不得引用不存在的证据 ID、禁止 Markdown 围栏等。
-
-评估结果进一步经过**确定性约束**校正（`constrainHypothesisAssessment`）：
-
-- 同时含支持与反驳证据 → 强制 `inconclusive`，置信度上限 0.5；
-- 声明 `supported` 但无支持证据 → 降级为 `proposed`（或有反驳则 `inconclusive`）；
-- 新假设 ID 由标题哈希生成（`hyp-` + SHA-256 前 4 字节），保证同一假设跨轮保持身份稳定；模型重复使用已有 ID 指向不同标题时会被拒绝覆盖。
-
-### 技能上下文组装
-
-`internal/agent` 的 `buildSkillContext` 负责把 L2 摘要与已加载的 L3 全文拼成每轮的技能上下文；`skillLoader` 实现容量 + LRU 淘汰；`Report.Knowledge` 记录实际使用的技能与级别（`summary` / `full`），供报告审计。技能上下文随工具执行（含 `load_skill` 本身）每轮**整条替换**（`upsertSkillContextMessage`，而非追加）：旧的技能上下文消息按固定标记移除后再写入最新版本，保证被 LRU 淘汰的技能正文不会残留在对话历史中，加载状态、模型可见上下文与报告记录三者一致。
-
-### MCP 能力
-
-`internal/mcp` 手写实现 MCP（2025-06-18 协议版本）的 stdio 传输子集，**不依赖任何 MCP 库**：
-
-| 方法                          | 类型           | 说明                       |
-| --------------------------- | ------------ | ------------------------ |
-| `initialize`                | request      | 握手：返回协议版本、能力（tools）、服务信息 |
-| `notifications/initialized` | notification | 握手完成通知                   |
-| `ping`                      | request      | 存活检查                     |
-| `tools/list`                | request      | 列出工具（schema 直接投影自工具注册表）  |
-| `tools/call`                | request      | 执行工具，返回结构化内容             |
-| `shutdown`                  | request      | 优雅退出                     |
-
-实现要点：
-
-- **传输**：stdio 上换行分隔的 JSON-RPC 2.0 消息（MCP stdio 帧格式，区别于 LSP 的 `Content-Length` 帧）。
-- **错误码映射**：JSON-RPC 标准码 `-32700 / -32600 / -32601 / -32602 / -32603`，加 MCP 握手门 `-32002`（未完成 `initialize` 前拒绝除握手/ping/shutdown 外的请求）。
-- **工具错误 vs 协议错误分层**：工具执行失败返回 `content` + `isError: true`（可交给模型继续推理）；协议违规才使用 JSON-RPC 错误码。
-- **Schema 复用**：`tools/list` 的 `inputSchema` 直接投影自 `tool.Registry.ToLLMDefinitions()`，注册一个工具即同时获得 Function Calling 与 MCP 两种暴露——`load_skill` 注册后同样对 MCP 客户端可见、可调。
-- **端到端测试**：`internal/mcp` 的测试用 `io.Pipe` 在同进程内驱动真实的 stdio 帧（握手 → 列工具 → 调工具 → 错误路径），不依赖外部进程。
-
-### 可插拔数据源
-
-`datasource.Provider` 只有两个方法：`QueryMetrics(ctx, MetricsQuery)` 与 `SearchLogs(ctx, LogsQuery)`。mock 实现从 JSON 读取场景数据，支持：
-
-- 服务名别名归一化（`order` / `订单` → `order-service`，`mysql` / `database` → `database` 等）；
-- 指标按 `Names` 过滤、按时间窗过滤、按时间升序返回；
-- 日志按服务 + 时间窗 + 关键词检索（大小写不敏感、分词 ≥3 字符、停用词过滤）。
-
-替换为真实数据源（Prometheus / OpenSearch 等）时，只需实现该接口，调查循环与工具层零改动。
-
-## 测试
-
-| 包                | 覆盖点                                                                                  |
-| ---------------- | ------------------------------------------------------------------------------------ |
-| `internal/agent` | 状态机迁移合法性；规划器校验（空工具/非法工具/未知假设 ID）；运行时主循环（计划强制、预算、证据编号、终局报告）；**证据边界（`evidence=false` 工具结果不进证据存储但可达模型）**；**技能上下文整条替换（LRU 淘汰后旧正文不残留）**；**Context 取消贯穿规划器**；**single-shot 基线（不规划不执行工具）**；**终局报告证据链结构字段解析与默认值**；假设评估（确定性约束、证据引用校验、ID 稳定性）；技能加载器 LRU 淘汰与刷新；token 估算；韧性路径（规划器降级不失败、配置错误仍失败、终局 JSON 围栏容忍、JSON 修复：大写布尔/None/尾逗号且不改字符串内容） |
-| `internal/skills`| front-matter 解析（含缺 name 报错）；重名与空目录报错；L1 索引内容；中英文/大小写触发词匹配；无命中；全量正文读取 |
-| `internal/llm`   | 重试：429/5xx 重试成功、401 不重试、网络错误重试、上下文取消中断重试循环；可重试错误分类 |
-| `internal/mcp`   | 协议端到端：握手、握手门、列工具、调工具、未知工具、非法参数、未知方法、解析错误、ping、shutdown                               |
-
-```bash
-go test ./... -v
-```
-
-## 已知限制与 Roadmap
-
-- **数据源为 mock**：`Provider` 接口已就绪，真实数据源连接器待实现。
-- **LLM 层仍较薄**：消息历史无上下文压缩，无流式输出，重试为固定策略（未读 `Retry-After` 响应头）。
-- **技能检索为简单匹配**：`Library.Match` 是包含匹配，未做同义词/模糊扩展；技能库规模增大后 L1 索引的常驻成本会上升，可考虑按需裁剪。
-- **token 估算为近似**：适用于硬上限控制；若要与模型真实计费对齐，应接入具体模型分词器。
-- **MCP 仅 stdio 本地**：无鉴权/OAuth、无 streamable HTTP transport、无外部 server 注册中心（均为有意的范围裁剪）。
-- **评测未接入 CI**：`evals/run.ps1` 已可一键批量评测并支持消融模式（`full` / `no-skills` / `single-shot`），但依赖真实 LLM API，尚未接入 CI 与回归基线。
-- **证据约束消融未做**：评测支持关闭技能（`-no-skills`）与单轮基线（`-single-shot`），但"关闭证据纪律约束"（假设评估不做确定性校正）的开关尚未实现，可作为下一步实验。
-- **证据质量维度是引用合法性**：四维评分中的"证据质量"检查结构化假设引用的证据 ID 是否真实存在，属于程序可验证的引用合法性；"证据是否真的支持结论"仍需模型判断与人工/关键词校验，语义级证据质量是后续方向。
-- **未添加 LICENSE**：开源前需补充。
+- [ ] 接入 Prometheus 指标与 OpenSearch / Elasticsearch 日志查询
+- [ ] 增加真实故障样本和语义级诊断评测
+- [ ] 补充上下文压缩与更精确的 Token 计量
+- [ ] 将评测集成到 CI，建立回归基线
+- [ ] 完善 MCP 客户端接入说明与集成测试
+- [ ] 增加 LICENSE 与贡献指南
 
 ## License
 
-尚未添加。在添加 LICENSE 之前，保留所有权利。
+当前仓库尚未添加 LICENSE。添加明确的开源许可证前，默认保留所有权利。
