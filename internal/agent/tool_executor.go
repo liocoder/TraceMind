@@ -117,7 +117,14 @@ func ExecuteToolCalls(
 			Content:    toolResult.Content,
 		})
 
-		// 只为成功执行的工具结果建立证据。
+		// 参考知识类工具（如 load_skill）在 Metadata 中声明 evidence=false。
+		// 其结果仍作为 tool 消息返回给模型，但不进入 Evidence Store，
+		// 避免领域知识被当成当前事故的现场观测。
+		if value, ok := toolResult.Metadata["evidence"]; ok && value == "false" {
+			continue
+		}
+
+		// 只为成功执行的现场观测工具结果建立证据。
 		source := call.Function.Name
 		if value, ok := toolResult.Metadata["source"]; ok && value != "" {
 			source = value

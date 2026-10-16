@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/liocoder/TraceMind/internal/llm"
 )
@@ -16,6 +18,13 @@ type scriptedPlanner struct {
 }
 
 func (p *scriptedPlanner) Plan(input PlanningInput) (InvestigationPlan, error) {
+	return p.PlanContext(context.Background(), input)
+}
+
+func (p *scriptedPlanner) PlanContext(
+	ctx context.Context,
+	input PlanningInput,
+) (InvestigationPlan, error) {
 	p.called = true
 	return InvestigationPlan{}, p.planErr
 }
@@ -116,5 +125,68 @@ func TestStripCodeFences(t *testing.T) {
 		if got := stripCodeFences(test.in); got != test.want {
 			t.Fatalf("stripCodeFences(%q) = %q, want %q", test.in, got, test.want)
 		}
+	}
+}
+
+// blockingPlanner 阻塞在计划调用上，直到 context 被取消，用于验证
+// Runtime 是否把控制权（取消/超时）真正传给规划器。
+type blockingPlanner struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (p *blockingPlanner) Plan(input PlanningInput) (InvestigationPlan, error) {
+	return p.PlanContext(context.Background(), input)
+}
+
+func (p *blockingPlanner) PlanContext(
+	ctx context.Context,
+	input PlanningInput,
+) (InvestigationPlan, error) {
+	p.once.Do(func() { close(p.entered) })
+	<-ctx.Done()
+	return InvestigationPlan{}, ctx.Err()
+}
+
+func TestRuntimeCancellationPropagatesToPlanner(t *testing.T) {
+	client := &fakeCompletionClient{
+		complete: func(
+			ctx context.Context,
+			messages []llm.Message,
+			definitions []llm.ToolDefinition,
+		) (*llm.Completion, error) {
+			return &llm.Completion{
+				Message: llm.Message{
+					Role:    "assistant",
+					Content: `{"summary":"x","hypotheses":[]}`,
+				},
+				FinishReason: "stop",
+			}, nil
+		},
+	}
+
+	runtime := newTestRuntime(t, 3, client)
+	planner := &blockingPlanner{entered: make(chan struct{})}
+	runtime.SetPlanner(planner)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = runtime.Run(ctx, "order service returns HTTP 502")
+	}()
+
+	select {
+	case <-planner.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("planner was never called")
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after context cancellation")
 	}
 }

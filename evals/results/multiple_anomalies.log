@@ -4,11 +4,11 @@ Mock scenario: multiple_anomalies
 
 [TraceMind] tool=query_metrics arguments={"service": "order-service"}
 [TraceMind] result=service=order-service, timestamp=2026-10-15T11:30:00Z, status=degraded, connection_pool_usage=97%, cpu_usage=96%, error_rate=16%, p95_latency_ms=3500ms
-[TraceMind] tool=search_logs arguments={"query": "order-service connection pool exhaustion timeout error retry slow query"}
-[TraceMind] result=2026-10-15T11:30:01Z ERROR service=order-service connection pool exhausted during high CPU load
-2026-10-15T11:30:02Z WARN service=order-service request queue length increased significantly
 [TraceMind] tool=query_metrics arguments={"service": "order-service"}
 [TraceMind] result=service=order-service, timestamp=2026-10-15T11:30:00Z, status=degraded, connection_pool_usage=97%, cpu_usage=96%, error_rate=16%, p95_latency_ms=3500ms
+[TraceMind] tool=search_logs arguments={"query": "order-service connection pool exhausted timeout error latency"}
+[TraceMind] result=2026-10-15T11:30:01Z ERROR service=order-service connection pool exhausted during high CPU load
+2026-10-15T11:30:02Z WARN service=order-service request queue length increased significantly
 {
   "incident": "The order service has high latency, a high error rate, high CPU usage, and high connection pool utilization. Investigate the likely failure mechanism and remaining uncertainty.",
   "state": "completed",
@@ -27,103 +27,131 @@ Mock scenario: multiple_anomalies
     "completed"
   ],
   "tool_calls": 3,
-  "summary": "The order-service is in a degraded state with corroborated evidence of resource saturation and queueing. Metrics at 2026-10-15T11:30:00Z show status=degraded, connection_pool_usage=97%, cpu_usage=96%, error_rate=16%, and p95_latency_ms=3500ms. Logs at 11:30:01-02Z explicitly report 'connection pool exhausted during high CPU load' and 'request queue length increased significantly'. These observations consistently support a failure mechanism in which near-saturated CPU and a nearly exhausted connection pool cause request queueing, elevated latency (3500ms p95), and a 16% error rate. However, the evidence is a single duplicate metrics snapshot plus two log lines; it does not establish which resource (CPU or connection pool) is the primary constrained driver, the identity/nature of the connection pool (e.g., database), the direction of causation (whether saturation caused errors or errors/retries caused saturation), or whether an external load spike or retry storm initiated the condition. No downstream dependency (e.g., database or a downstream service) was investigated, so any external root cause remains unverified. The reported resource-saturation mechanism is the best-supported explanation but a single confirmed root cause is not established.",
+  "summary": "The order-service is degraded with concurrent resource saturation: connection_pool_usage=97%, cpu_usage=96%, error_rate=16%, and p95_latency=3500ms at 2026-10-15T11:30:00Z. Concurrent logs at 11:30:01-02Z report 'connection pool exhausted during high CPU load' and a significantly increased request queue length. The leading hypothesis is that connection-pool exhaustion and CPU saturation together form the proximate failure mechanism: requests queue, latency rises, and some fail (16% error rate). However, all evidence is from a single time point (metrics snapshot duplicated) plus concurrent logs without tracing, so causal direction is unproven — CPU saturation could delay connection handling, or pool contention/retries could inflate CPU, or an external/underlying fault could have driven both saturation signals. The root cause is not confirmed.",
   "hypotheses": [
-    "Resource saturation within order-service (near-exhausted connection pool at 97% and near-max CPU at 96%) causes connection acquisition/request queueing, driving the 3500ms p95 latency and 16% error rate.",
-    "An external increase in inbound request volume or a retry storm is the initiating driver, overloading both CPU and the connection pool and thereby producing the observed latency and errors.",
-    "The connection pool is backed by a downstream dependency (e.g., a database or another service) whose own latency/availability problems stall connection handling; the pool exhaustion and CPU load are consequences rather than the originating cause.",
-    "The high CPU usage and high connection pool utilization are independent co-symptoms of a common upstream fault (e.g., dependency latency, lock contention, or GC pressure) rather than one causing the other."
+    "Connection-pool exhaustion is the proximate failure mechanism: requests wait for pool connections, causing the queue growth, 3500ms latency, and 16% errors, with CPU saturation as a contributor or consequence.",
+    "CPU saturation (96%) is the primary driver: CPU-bound processing delays connection handling and request processing, indirectly raising pool utilization and errors.",
+    "An underlying external fault (e.g., a slow downstream dependency or database) drove both high CPU and connection-pool contention, with saturation being a symptom rather than the cause.",
+    "A retry storm inflated by pool or CPU contention amplified load, creating a self-reinforcing degradation loop."
   ],
   "evidence": [
     {
       "id": "ev-001",
       "source": "metrics-provider",
       "content": "service=order-service, timestamp=2026-10-15T11:30:00Z, status=degraded, connection_pool_usage=97%, cpu_usage=96%, error_rate=16%, p95_latency_ms=3500ms",
-      "created_at": "2026-10-15T13:07:36.9778473Z"
+      "created_at": "2026-10-16T05:30:56.0845408Z"
     },
     {
       "id": "ev-002",
-      "source": "logs-provider",
-      "content": "2026-10-15T11:30:01Z ERROR service=order-service connection pool exhausted during high CPU load\n2026-10-15T11:30:02Z WARN service=order-service request queue length increased significantly",
-      "created_at": "2026-10-15T13:07:44.2025139Z"
+      "source": "metrics-provider",
+      "content": "service=order-service, timestamp=2026-10-15T11:30:00Z, status=degraded, connection_pool_usage=97%, cpu_usage=96%, error_rate=16%, p95_latency_ms=3500ms",
+      "created_at": "2026-10-16T05:31:00.5375143Z"
     },
     {
       "id": "ev-003",
-      "source": "metrics-provider",
-      "content": "service=order-service, timestamp=2026-10-15T11:30:00Z, status=degraded, connection_pool_usage=97%, cpu_usage=96%, error_rate=16%, p95_latency_ms=3500ms",
-      "created_at": "2026-10-15T13:07:50.3349235Z"
+      "source": "logs-provider",
+      "content": "2026-10-15T11:30:01Z ERROR service=order-service connection pool exhausted during high CPU load\n2026-10-15T11:30:02Z WARN service=order-service request queue length increased significantly",
+      "created_at": "2026-10-16T05:31:05.448598Z"
     }
   ],
   "plans": [
     {
       "tool_name": "query_metrics",
-      "rationale": "No observations or hypotheses exist yet. Querying metrics for the order service is the most direct way to confirm which symptoms are present (latency, error rate, CPU, connection pool utilization) and establish a baseline for the failure mechanism before searching logs.",
-      "expected_observation": "Service-level metrics for the order service showing latency, error rate, CPU usage, and connection pool utilization trends, which will indicate whether resource saturation (CPU/pool) correlates with the errors."
-    },
-    {
-      "tool_name": "search_logs",
-      "rationale": "The current metrics only show correlated high CPU and connection pool utilization without indicating whether the primary failure mechanism is resource exhaustion, overload, or retry storm. Searching order-service logs for keywords such as connection pool, timeout, error, retry, and slow can reveal whether requests are timing out waiting for DB connections, whether retries are amplifying load, or whether errors are downstream DB/network issues, thus distinguishing the competing hypotheses.",
-      "target_hypothesis_id": "hyp-3a7c1e42",
-      "expected_observation": "Log entries showing connection acquisition timeouts, pool exhaustion warnings, retry attempts, or specific error messages that indicate the sequence of failures and whether resource saturation or external load/retries is the primary driver."
+      "rationale": "No observations have been collected yet. Querying service health metrics for the order service is the most direct way to confirm the reported high latency, error rate, CPU, and connection pool utilization, and to see which metric is the leading indicator (CPU saturation vs. connection pool exhaustion) — distinguishing competing failure mechanisms.",
+      "expected_observation": "Concrete metric values for the order service (latency, error rate, CPU usage, connection pool utilization/utilization percentage), possibly with a time series showing which metric spiked first or is most saturated."
     },
     {
       "tool_name": "query_metrics",
-      "rationale": "The two competing hypotheses (resource saturation vs. overload/retry storm) cannot be distinguished by the single snapshot. Querying metrics again for order-service is the most direct way to obtain time-series or additional metric dimensions (e.g., request rate, pool wait time) that would reveal whether utilization rose due to a primary resource fault or due to increased load/retries. The connection_pool skill also recommends query_metrics for pool exhaustion triage.",
-      "expected_observation": "Time-series or additional metrics for order-service showing request rate, connection pool wait/acquire time, queue depth, and CPU trend. A rising inbound request rate would support hyp-9f2b6d10 (overload/retry storm); CPU/pool saturation without increased demand and with high acquisition wait would support hyp-3a7c1e42 (resource saturation)."
+      "rationale": "Only a single correlated snapshot exists. Querying a broader or historical metrics view for order-service can establish temporal ordering and whether CPU saturation, pool exhaustion, or errors arose first, which is needed to move beyond the untested saturation hypothesis.",
+      "target_hypothesis_id": "hyp-a1b2c3d4",
+      "expected_observation": "Time-series metrics for order-service showing the onset/sequence of CPU usage, connection pool utilization, error rate, and latency, which can distinguish CPU-first saturation from pool-first contention or an independent common cause."
+    },
+    {
+      "tool_name": "search_logs",
+      "rationale": "The current evidence is a single duplicated metrics snapshot, so causal direction and mechanism are unresolved. Searching order-service logs can reveal whether connection-pool acquisition failures/timeouts, CPU-induced scheduling delays, retries, or an upstream/downstream fault are driving the symptoms, which distinguishes hyp-a1b2c3d4 from an unobserved underlying fault.",
+      "target_hypothesis_id": "hyp-a1b2c3d4",
+      "expected_observation": "Log entries showing connection acquisition timeouts or pool-exhaustion errors, retry storms, slow request processing, upstream/downstream errors, or other clues indicating whether saturation is causal or secondary."
     }
   ],
   "diagnosis_hypotheses": [
     {
-      "id": "hyp-3a7c1e42",
-      "title": "Resource saturation degrading order-service",
-      "description": "The order service is showing concurrent high CPU utilization (96%) and high connection pool utilization (97%), alongside a 16% error rate and elevated p95 latency (3500ms). One plausible explanation is that the service is resource-constrained: its CPU is near capacity and its connection pool is nearly exhausted, which could cause request queueing or acquisition timeouts and manifest as rising latency and errors. The logs explicitly state the connection pool was exhausted during high CPU load and that a request queue length increased significantly, which strengthens a saturation-and-queueing mechanism. However, the evidence does not establish which resource (CPU or connection pool) is the primary driver, nor whether high utilization is a cause or a consequence of increased load or retries. The exact nature of the connection pool is not identified by the evidence.",
-      "status": "supported",
-      "confidence": 0.6,
+      "id": "hyp-5f6a7b8c",
+      "title": "Connection pool exhaustion as the proximate failure mechanism",
+      "description": "A connection pool exhaustion error was logged at the same time the service was degraded, with connection_pool_usage at 97% and a significantly increased request queue length. A plausible mechanism is that the connection pool became a bottleneck, so requests waited for connections, driving latency up to 3500ms and contributing to the 16% error rate. The high CPU (96%) could be either a contributing factor to or a consequence of pool contention. Because the evidence is a single metrics snapshot plus concurrent logs without request traces or pool configuration details, the direction of causation and whether exhaustion is the root cause versus a symptom of another fault remains uncertain.",
+      "status": "proposed",
+      "confidence": 0.35,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "supports",
-          "reason": "The metrics snapshot shows simultaneous high CPU (96%) and connection pool utilization (97%) with degraded status, 16% error rate, and 3500ms p95 latency, which is consistent with a resource saturation mechanism, though it does not by itself prove exhaustion, queueing, or causal direction."
-        },
-        {
-          "evidence_id": "ev-002",
-          "relation": "supports",
-          "reason": "Logs report connection pool exhaustion during high CPU load and significantly increased request queue length, directly supporting the saturation-and-queueing part of the hypothesis, while still not isolating the primary constrained resource or the initiating cause."
+          "reason": "Shows connection_pool_usage=97% alongside 16% error rate and 3500ms p95 latency, consistent with pool utilization being at a level where exhaustion and request queueing would plausibly occur."
         },
         {
           "evidence_id": "ev-003",
           "relation": "supports",
-          "reason": "This duplicate metrics snapshot corroborates the same concurrent CPU and connection pool utilization along with degraded status, error rate, and latency, reinforcing consistency with saturation but adding no new causal information."
+          "reason": "Explicitly reports connection pool exhaustion and a significantly increased request queue length, directly indicating the connection pool was under stress and requests were backing up during the degradation window."
         }
       ]
     },
     {
-      "id": "hyp-9f2b6d10",
-      "title": "Elevated load or retry storm driving utilization and errors",
-      "description": "An alternative explanation is that an external or internal increase in request volume, or a retry storm triggered by earlier failures, is driving both the near-capacity CPU and connection pool utilization and the high error rate. In this framing, the high latency and errors could stem from overload rather than an intrinsic resource fault. The evidence does not distinguish increased incoming load from degraded internal handling, so this remains a plausible but unverified alternative. The increased request queue length is consistent with overload, but connection pool identity and any upstream cause are not established by the supplied evidence.",
+      "id": "hyp-a1b2c3d4",
+      "title": "Resource saturation degrading order service",
+      "description": "The order service shows concurrent saturation signals: high CPU utilization (96%) and high connection pool utilization (97%), alongside elevated error rate (16%) and p95 latency (3500ms). A plausible mechanism is that resource saturation constrains request processing, increasing latency and errors. Logs additionally report a connection pool exhaustion error coinciding with high CPU load and a significantly increased request queue length, which is consistent with a saturation and queueing mechanism. However, the metrics snapshot is a single time point (duplicated across two evidence items), and the logs are concurrent rather than tracing-based, so causal direction and the exact mechanism (e.g., CPU saturation delaying connection handling versus pool contention causing retry-driven CPU load) remain unestablished. An unobserved underlying fault could have driven both the saturation metrics and the error/latency increase simultaneously.",
       "status": "proposed",
-      "confidence": 0.3,
+      "confidence": 0.45,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "supports",
-          "reason": "Concurrent near-saturation of CPU (96%) and connection pool usage (97%) together with a 16% error rate is consistent with an overload or retry-driven mechanism, but the metric alone cannot confirm the source of the load or establish causation."
+          "reason": "The snapshot directly shows degraded status with cpu_usage=96% and connection_pool_usage=97%, indicating resource utilization near capacity, consistent with a saturation concern; error_rate=16% and p95_latency_ms=3500ms show correlated service impact, though causation is not proven."
         },
         {
           "evidence_id": "ev-002",
           "relation": "neutral",
-          "reason": "A significantly increased request queue length is consistent with elevated demand or retries, but the log does not quantify incoming request volume or identify retries, so it neither confirms nor refutes this alternative."
+          "reason": "This is effectively a duplicate of ev-001 with the same timestamp and values, so it adds no independent corroboration and does not strengthen or weaken the saturation hypothesis."
+        },
+        {
+          "evidence_id": "ev-003",
+          "relation": "supports",
+          "reason": "Logs report a connection pool exhaustion error during high CPU load and a significantly increased request queue length, which is consistent with saturation and request queueing; these are concurrent log observations, not causal trace evidence, so they support but do not confirm the mechanism."
         }
       ]
     }
   ],
+  "observed_facts": [
+    "order-service status=degraded at 2026-10-15T11:30:00Z with connection_pool_usage=97%, cpu_usage=96%, error_rate=16%, p95_latency_ms=3500ms.",
+    "A repeated metrics query returned the identical timestamp and values, providing no independent time-series or temporal ordering.",
+    "Log at 2026-10-15T11:30:01Z: ERROR service=order-service connection pool exhausted during high CPU load.",
+    "Log at 2026-10-15T11:30:02Z: WARN service=order-service request queue length increased significantly."
+  ],
+  "supporting_evidence": [
+    "connection_pool_usage=97% is near capacity, consistent with pool exhaustion and request queueing.",
+    "Explicit log of 'connection pool exhausted' directly confirms pool exhaustion occurred during the degradation window.",
+    "Log of 'request queue length increased significantly' indicates requests were backing up, consistent with pool-limited throughput raising latency.",
+    "cpu_usage=96% co-occurs with pool exhaustion, supporting a saturation/queueing mechanism."
+  ],
+  "refuting_evidence": [
+    "All metrics are from a single time point (duplicated), so no temporal ordering can show whether CPU, pool, or errors rose first.",
+    "No tracing evidence establishes that pool waits caused the latency/errors; logs are concurrent, not causal.",
+    "No evidence rules out an external/downstream fault driving both CPU and pool saturation."
+  ],
+  "unverified_issues": [
+    "Whether connection-pool exhaustion is the root cause or a symptom of another fault.",
+    "The causal direction between CPU saturation and pool contention.",
+    "Whether a downstream dependency (e.g., database or payment service) or a retry storm is the true origin.",
+    "Pool configuration, connection count, and any upstream dependency health were not examined.",
+    "Time-series onset ordering of CPU, pool utilization, error rate, and latency is unknown."
+  ],
+  "confidence": "medium",
+  "next_steps": [
+    "Query time-series metrics over the window preceding 11:30Z to establish which signal (CPU, pool utilization, errors, latency) rose first.",
+    "Capture distributed traces or thread/connection pool diagnostics of order-service requests to confirm whether time is spent waiting for connections versus CPU-bound processing.",
+    "Check health and latency of order-service's downstream dependencies (e.g., database, payment-service) to test the external-fault hypothesis.",
+    "Inspect connection pool configuration (max connections, wait timeout) and request rate for evidence of a retry storm."
+  ],
   "knowledge": [
     {
       "name": "connection_pool",
-      "level": "summary"
-    },
-    {
-      "name": "database_latency",
       "level": "summary"
     }
   ]

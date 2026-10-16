@@ -4,10 +4,12 @@ Mock scenario: redis_latency
 
 [TraceMind] tool=query_metrics arguments={"service": "order-service"}
 [TraceMind] result=service=order-service, timestamp=2026-10-15T10:40:00Z, status=degraded, connection_pool_usage=48%, cpu_usage=36%, error_rate=6%, p95_latency_ms=1700ms
-[TraceMind] tool=query_metrics arguments={"service": "order-service"}
-[TraceMind] result=service=order-service, timestamp=2026-10-15T10:40:00Z, status=degraded, connection_pool_usage=48%, cpu_usage=36%, error_rate=6%, p95_latency_ms=1700ms
-[TraceMind] tool=query_metrics arguments={"service": "order-service-cache"}
-[TraceMind] result=No metrics available for the requested service and time range.
+[TraceMind] hypothesis evaluation degraded (parse hypothesis evaluation JSON: invalid character '`' looking for beginning of value; response="```json\n{\n  \"hypotheses\": [\n    {\n      \"id\": \"hyp-3f7a2c91\",\n      \"title\": \"Cache access may contribute to order-service latency\",\n      \"description\": \"The order-service is reported as degraded with p95 latency of 1700ms and a 6% error rate, while CPU (36%) and connection pool usage (48%) remain moderate. The moderate resource utilization does not suggest compute or connection saturation, so latency could plausibly arise from time spent waiting on a downstream dependency such as cache access ..."); keeping previous assessment
+[TraceMind] tool=search_logs arguments={"query": "order-service cache timeout miss connection error latency"}
+[TraceMind] result=2026-10-15T10:40:01Z WARN service=order-service cache lookup latency increased
+2026-10-15T10:40:02Z ERROR service=redis redis command timeout and elevated command latency
+[TraceMind] tool=query_metrics arguments={"service": "redis"}
+[TraceMind] result=service=redis, timestamp=2026-10-15T10:40:00Z, status=degraded, command_latency_ms=950ms, error_rate=14%
 {
   "incident": "The order service has increased latency. Investigate whether cache access may be involved.",
   "state": "completed",
@@ -26,76 +28,129 @@ Mock scenario: redis_latency
     "completed"
   ],
   "tool_calls": 3,
-  "summary": "The order-service is observed to be degraded, with p95_latency_ms=1700ms, error_rate=6%, connection_pool_usage=48%, and cpu_usage=36% at timestamp 2026-10-15T10:40:00Z. These are the only concrete observations from the current incident. The increase in latency is real, but no cache-specific telemetry (hit ratio, cache access latency, eviction/contention metrics, or cache connection counts) was available: a query for the order-service cache layer returned no metrics for the requested service and time range. Consequently, there is no evidence that cache access is slow, contended, or otherwise involved in the latency increase, nor is there evidence that it is not involved. The moderate connection_pool_usage (48%) and cpu_usage (36%) do not indicate saturation of those resources, but they also do not rule out other causes such as downstream dependency slowness or internal database latency. The root cause remains unconfirmed; cache involvement is a plausible but entirely unverified hypothesis, and the absence of cache metrics is an important observability gap rather than proof of a cache fault.",
+  "summary": "The order-service is degraded (p95 latency 1700ms, error_rate 6%) and cache-related telemetry is temporally correlated: the order-service logs a cache lookup latency increase, and Redis itself is degraded with command_latency_ms=950ms and error_rate=14% at the same timestamp. This is consistent with cache access (a slow/degraded Redis backend) contributing to order-service latency. However, the evidence is correlational and does not establish causation: order-service CPU (36%) and connection pool (48%) are not saturated, ruling out those as likely drivers, but the root cause of the Redis degradation itself is unknown, and no dependency-call/timeout breakdown or other cache-dependent services were examined. The leading hypothesis (Redis-side degradation impacting a cache-dependent order service) is supported but not confirmed.",
   "hypotheses": [
-    "Cache access contention or degradation within the order service (or its cache layer) contributes to the elevated p95 latency, but this cannot be verified because no cache-specific metrics were available for the incident window.",
-    "A downstream dependency (e.g., a database or another service) is slow, causing the order service to wait on calls and inflating latency; this would be consistent with the observed error rate of 6%, but no downstream metrics or logs were collected to confirm it.",
-    "The order service is experiencing increased internal processing latency unrelated to cache or downstream calls (for example, application-level contention or GC/CPU scheduling effects), despite cpu_usage being only 36% and connection_pool_usage 48% at the sampled timestamp."
+    "Redis command latency/timeout degradation is causing slow cache lookups that add latency to order-service request paths (supported, not confirmed).",
+    "The order-service degradation and Redis degradation share a common upstream cause not yet identified.",
+    "An order-service internal issue unrelated to cache is the primary driver, with Redis slowness being coincidental."
   ],
   "evidence": [
     {
       "id": "ev-001",
       "source": "metrics-provider",
       "content": "service=order-service, timestamp=2026-10-15T10:40:00Z, status=degraded, connection_pool_usage=48%, cpu_usage=36%, error_rate=6%, p95_latency_ms=1700ms",
-      "created_at": "2026-10-15T13:05:49.802597Z"
+      "created_at": "2026-10-16T05:28:54.1430028Z"
     },
     {
       "id": "ev-002",
-      "source": "metrics-provider",
-      "content": "service=order-service, timestamp=2026-10-15T10:40:00Z, status=degraded, connection_pool_usage=48%, cpu_usage=36%, error_rate=6%, p95_latency_ms=1700ms",
-      "created_at": "2026-10-15T13:05:55.6849128Z"
+      "source": "logs-provider",
+      "content": "2026-10-15T10:40:01Z WARN service=order-service cache lookup latency increased\n2026-10-15T10:40:02Z ERROR service=redis redis command timeout and elevated command latency",
+      "created_at": "2026-10-16T05:28:58.3672654Z"
     },
     {
       "id": "ev-003",
       "source": "metrics-provider",
-      "content": "No metrics available for the requested service and time range.",
-      "created_at": "2026-10-15T13:06:00.9622875Z"
+      "content": "service=redis, timestamp=2026-10-15T10:40:00Z, status=degraded, command_latency_ms=950ms, error_rate=14%",
+      "created_at": "2026-10-16T05:29:04.9684733Z"
     }
   ],
   "plans": [
     {
       "tool_name": "query_metrics",
-      "rationale": "No observations have been collected yet. Querying metrics for the order service is the most direct way to characterize the reported latency increase and see whether cache-related metrics (e.g., cache hit ratio, cache access latency) are abnormal, which would inform or rule out cache involvement.",
-      "expected_observation": "Order service latency metrics over the incident window, plus any cache-related metrics (hit/miss ratio, cache latency) that indicate whether cache access correlates with the latency increase."
+      "rationale": "The incident is about increased latency in the order service, and cache access is a suspected factor. Querying the order service's metrics (e.g., latency, cache hit rate/miss rate, cache error rates) will provide direct evidence to confirm or rule out cache involvement before narrowing further.",
+      "expected_observation": "Latency metrics for the order service, plus cache-related metrics such as cache hit ratio, cache miss rate, or cache latency, and any abnormal trends that indicate whether cache access correlates with the latency increase."
+    },
+    {
+      "tool_name": "search_logs",
+      "rationale": "The only evidence so far shows degraded order-service metrics (high latency, 6% errors, moderate connection pool and CPU) but does not yet reveal whether cache access (e.g., timeouts, misses, or connection errors to a cache) is involved. Searching logs for cache-related errors/timeouts is the most direct way to distinguish a cache-access issue from other causes.",
+      "expected_observation": "Log entries mentioning cache timeouts, cache connection failures, cache miss storms, or similar cache-access errors correlated with the latency increase."
     },
     {
       "tool_name": "query_metrics",
-      "rationale": "The only evidence so far is generic service health metrics that do not include any cache-specific signals. Querying order-service metrics is the most direct way to obtain cache-related indicators (e.g., cache hit ratio, cache latency, eviction/contention metrics) needed to test or falsify the cache-contention hypothesis, and it does not repeat the prior query since specific cache telemetry has not yet been observed.",
-      "target_hypothesis_id": "hyp-6c3f9a2b",
-      "expected_observation": "Cache-related metrics for order-service such as cache hit/miss ratio, cache access latency, eviction rate, or cache connection counts; degraded values would support cache contention, while normal cache metrics with continued high latency would weaken the hypothesis."
-    },
-    {
-      "tool_name": "query_metrics",
-      "rationale": "The only evidence is service-level order-service metrics with no cache-specific data. Querying metrics for cache-related signals (e.g., cache hit ratio/latency) is the most direct way to verify or refute the cache-access hypothesis, which is currently at 0.2 confidence.",
-      "target_hypothesis_id": "hyp-6c3f9a2b",
-      "expected_observation": "Cache hit ratio, cache latency, or cache connection/eviction metrics for order-service or its cache layer that would indicate cache degradation or contention."
+      "rationale": "The two competing hypotheses differ on whether the root cause is Redis-side (hyp-4b9d2e6f) versus a broader cache-access issue affecting order-service (hyp-3f7a1c2e). Querying Redis/cache service metrics directly can distinguish Redis command latency/timeout as the upstream condition from order-service-internal cache behavior, and also confirm whether other cache-dependent callers are affected. Connection pool and CPU are not saturated, so cache-path metrics are the most informative unresolved area.",
+      "target_hypothesis_id": "hyp-4b9d2e6f",
+      "expected_observation": "Redis service metrics showing elevated command latency, timeout counts, connection usage, and resource saturation at the incident timestamp; ideally whether Redis degradation is isolated to Redis or also reflected in other cache-dependent services."
     }
   ],
   "diagnosis_hypotheses": [
     {
-      "id": "hyp-6c3f9a2b",
-      "title": "Cache access contention or degradation may contribute to order service latency",
-      "description": "The order service is reported as degraded with elevated p95 latency (1700ms) and error rate (6%). Given the investigation focus on cache access, a plausible contributing factor is that cache access within the order service is slower or contested, causing requests to wait on cache operations. However, the supplied evidence contains no cache-specific metrics (hit ratio, cache latency, connection counts, eviction rates), so this remains an unverified possibility. connection_pool_usage=48% and cpu_usage=36% do not indicate saturation of those resource types, and one evidence item indicates no metrics were available for the requested range, so causal direction and mechanism cannot be established. This hypothesis is retained as plausible but unsubstantiated.",
-      "status": "inconclusive",
-      "confidence": 0.15,
+      "id": "hyp-3f7a1c2e",
+      "title": "Cache access latency contributing to order service latency",
+      "description": "The order service is degraded with elevated p95 latency and an error rate, while cache-related telemetry shows increased cache lookup latency and Redis command timeouts. This is consistent with slow cache access (e.g., Redis command latency/timeouts) contributing to the order service's increased latency. Redis-level metrics also show elevated command latency and errors. However, the evidence does not establish that cache access is the root cause: the cache and Redis observations are correlational in time with the service degradation, and the connection pool utilization and CPU metrics are not near saturation. Causal direction and mechanism remain unverified.",
+      "status": "supported",
+      "confidence": 0.6,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "supports",
-          "reason": "Shows order-service in degraded status with p95_latency_ms=1700ms and error_rate=6%, establishing degraded latency that a cache-access issue could plausibly contribute to, while connection_pool_usage=48% and cpu_usage=36% do not indicate saturation of those resources."
+          "reason": "Shows order-service is degraded with p95_latency_ms=1700ms and error_rate=6%, establishing the latency symptom under investigation; connection_pool_usage=48% and cpu_usage=36% are not near saturation, making those less likely explanations."
         },
         {
           "evidence_id": "ev-002",
-          "relation": "neutral",
-          "reason": "Repeats the same order-service observation (identical timestamp and values), so it adds no new information about cache access and neither strengthens nor weakens the cache hypothesis."
+          "relation": "supports",
+          "reason": "Logs show order-service cache lookup latency increased and Redis command timeouts with elevated command latency at nearly the same timestamp, which is temporally consistent with cache access slowing order-service responses, though it does not prove causation."
         },
         {
           "evidence_id": "ev-003",
-          "relation": "refutes",
-          "reason": "States that no metrics are available for the requested service and time range, indicating the observability data needed to assess cache behavior is missing, which weakens confidence that cache access can be implicated on this evidence."
+          "relation": "supports",
+          "reason": "Redis reports degraded status with command_latency_ms=950ms and error_rate=14%, directly indicating elevated latency and errors on the cache backend that the order service may depend on."
+        }
+      ]
+    },
+    {
+      "id": "hyp-4b9d2e6f",
+      "title": "Redis-level command latency/timeout degradation impacting cache-dependent callers",
+      "description": "Redis is reporting command timeouts and elevated command latency, with a degraded status and a 14% error rate. Services that depend on Redis for cache lookups, including the order service, could experience added latency if those calls block or retry. This hypothesis focuses on a Redis-side performance problem as the upstream condition, but the evidence does not confirm that Redis slowness is the sole or primary driver of the order service degradation, nor whether other callers are affected.",
+      "status": "supported",
+      "confidence": 0.55,
+      "evidence": [
+        {
+          "evidence_id": "ev-001",
+          "relation": "supports",
+          "reason": "The order-service degradation with elevated p95 latency at the same time is consistent with downstream impact of Redis slowness, though causal direction is not established."
+        },
+        {
+          "evidence_id": "ev-002",
+          "relation": "supports",
+          "reason": "Directly reports redis command timeout and elevated command latency, which is the Redis-side condition this hypothesis proposes as a driver of cache-dependent latency."
+        },
+        {
+          "evidence_id": "ev-003",
+          "relation": "supports",
+          "reason": "Redis metrics show degraded status, command_latency_ms=950ms, and error_rate=14%, providing direct quantitative confirmation of the Redis-side degradation proposed here."
         }
       ]
     }
+  ],
+  "observed_facts": [
+    "order-service status=degraded at 2026-10-15T10:40:00Z: p95_latency_ms=1700ms, error_rate=6%, connection_pool_usage=48%, cpu_usage=36%.",
+    "order-service log at 2026-10-15T10:40:01Z: WARN cache lookup latency increased.",
+    "redis log at 2026-10-15T10:40:02Z: ERROR redis command timeout and elevated command latency.",
+    "redis metrics at 2026-10-15T10:40:00Z: status=degraded, command_latency_ms=950ms, error_rate=14%."
+  ],
+  "supporting_evidence": [
+    "Redis is degraded with command_latency_ms=950ms and error_rate=14%, indicating the cache backend is slow and erroring.",
+    "order-service explicitly logs 'cache lookup latency increased', linking the latency symptom to the cache access path.",
+    "Temporal alignment: order-service and Redis degradation occur at the same timestamp window (10:40:00-10:40:02Z).",
+    "order-service CPU (36%) and connection pool (48%) are not saturated, making non-cache resource exhaustion a less likely explanation for the latency."
+  ],
+  "refuting_evidence": [
+    "No direct call-level measurement (e.g., per-request cache dependency latency/timeout counts) links Redis slowness to the order-service p95 increase; correlation is only temporal.",
+    "Redis degradation could itself be a symptom of a shared upstream cause rather than the driver of order-service latency.",
+    "No evidence rules out a non-cache order-service bottleneck contributing to the 1700ms p95."
+  ],
+  "unverified_issues": [
+    "Whether order-service requests actually block/retry on Redis cache calls and how much they contribute to the 1700ms p95.",
+    "The root cause of the Redis degradation (resource saturation, network, hot key, or upstream dependency) is unknown.",
+    "Whether other cache-dependent services are similarly affected, which would strengthen the Redis-as-driver hypothesis.",
+    "Contribution of order-service code paths, downstream dependencies, or DB access to the latency, since these were not inspected."
+  ],
+  "confidence": "medium",
+  "next_steps": [
+    "Inspect order-service traces/metrics for cache call duration and timeout counts to quantify the cache contribution to p95 latency.",
+    "Check Redis resource metrics (CPU, memory, connections, evictions) and slow-log entries to determine the cause of the 950ms command latency.",
+    "Verify whether other services depending on the same Redis are also degraded, to confirm Redis as a shared upstream driver.",
+    "Confirm the causal direction by checking whether order-service latency reductions correlate with Redis recovery."
   ],
   "knowledge": [
     {

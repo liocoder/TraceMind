@@ -26,6 +26,16 @@ type Report struct {
 	Plans               []InvestigationPlan    `json:"plans,omitempty"`
 	DiagnosisHypotheses []diagnosis.Hypothesis `json:"diagnosis_hypotheses,omitempty"`
 
+	// 终局报告的证据链结构：每条结论对应的已观察事实、支持/反驳证据、
+	// 未验证事项、置信程度与下一步验证动作。
+	// 这些字段由模型在终局诊断中填写，供审计与评测使用。
+	ObservedFacts      []string `json:"observed_facts,omitempty"`
+	SupportingEvidence []string `json:"supporting_evidence,omitempty"`
+	RefutingEvidence   []string `json:"refuting_evidence,omitempty"`
+	UnverifiedIssues   []string `json:"unverified_issues,omitempty"`
+	Confidence         string   `json:"confidence,omitempty"`
+	NextSteps          []string `json:"next_steps,omitempty"`
+
 	// Knowledge 保存最终使用的参考技能，便于审计来源。
 	// 这些条目不属于 Evidence，不参与当前事故证据计数。
 	Knowledge []SkillReference `json:"knowledge,omitempty"`
@@ -46,6 +56,7 @@ type Runtime struct {
 	maxToolCalls int
 	maxTokens    int
 	skills       *skills.Library
+	singleShot   bool
 }
 
 func NewRuntime(
@@ -93,6 +104,15 @@ func (r *Runtime) SetMaxTokens(max int) {
 func (r *Runtime) SetSkillsLibrary(lib *skills.Library) {
 	if r != nil {
 		r.skills = lib
+	}
+}
+
+// SetSingleShot 开启单轮 LLM 基线模式：
+// 不调用规划器、不执行任何工具，直接请求一次终局诊断。
+// 用于评测对照（评估多轮调查与技能机制的实际增益）。
+func (r *Runtime) SetSingleShot(enabled bool) {
+	if r != nil {
+		r.singleShot = enabled
 	}
 }
 
@@ -145,6 +165,11 @@ func (r *Runtime) Run(
 		Plans:               []InvestigationPlan{},
 		DiagnosisHypotheses: []diagnosis.Hypothesis{},
 		Knowledge:           []SkillReference{},
+		ObservedFacts:       []string{},
+		SupportingEvidence:  []string{},
+		RefutingEvidence:    []string{},
+		UnverifiedIssues:    []string{},
+		NextSteps:           []string{},
 	}
 
 	toolCallsUsed := 0
@@ -212,11 +237,29 @@ When finished, return valid JSON only:
   "summary": "Concise diagnosis including observed facts and uncertainty",
   "hypotheses": [
     "A plausible explanation that still needs verification"
+  ],
+  "observed_facts": [
+    "facts directly observed from tool results"
+  ],
+  "supporting_evidence": [
+    "observations supporting the leading hypothesis"
+  ],
+  "refuting_evidence": [
+    "observations against it, or an empty array"
+  ],
+  "unverified_issues": [
+    "what remains unknown or unverified"
+  ],
+  "confidence": "high|medium|low",
+  "next_steps": [
+    "what would verify the root cause"
   ]
 }
 
 The summary must be a string.
 Hypotheses must be an array of strings.
+The structured fields make the diagnosis auditable; use them honestly
+and leave arrays empty when nothing applies.
 Do not include Markdown code fences around the JSON.`
 
 	messages := []llm.Message{
@@ -227,7 +270,7 @@ Do not include Markdown code fences around the JSON.`
 		},
 	}
 
-	if r.skills != nil && loader != nil {
+	if r.skills != nil && loader != nil && !r.singleShot {
 		messages = append(messages, llm.Message{
 			Role:    "system",
 			Content: r.skills.Index(),
@@ -239,10 +282,7 @@ Do not include Markdown code fences around the JSON.`
 			loader,
 		)
 		if skillMessage != "" {
-			messages = append(messages, llm.Message{
-				Role:    "system",
-				Content: skillMessage,
-			})
+			messages = upsertSkillContextMessage(messages, skillMessage)
 		}
 
 		skillRefs = refs
@@ -253,6 +293,11 @@ Do not include Markdown code fences around the JSON.`
 	// 每轮最多执行一个工具调用。
 	// 额外轮次用于完成调查后的最终诊断。
 	maxRounds := maxCalls + 4
+
+	// 单轮基线：直接强制终局，跳过规划器与工具执行。
+	if r.singleShot {
+		forceFinal = true
+	}
 
 	for round := 1; round <= maxRounds; round++ {
 		if err := ctx.Err(); err != nil {
@@ -281,7 +326,7 @@ Do not include Markdown code fences around the JSON.`
 				})
 			}
 
-			plan, err = r.planner.Plan(PlanningInput{
+			plan, err = r.planner.PlanContext(ctx, PlanningInput{
 				Incident:      incident,
 				Evidence:      evidenceStore.List(),
 				Hypotheses:    diagnosisManager.List(),
@@ -632,9 +677,11 @@ Do not include Markdown code fences around the JSON.`
 			}
 		}
 
-		// 新证据可能改变技能匹配方向，因此重新计算技能上下文。
-		// 技能库异常时保留上一轮知识，不能影响事故诊断主流程。
-		if r.skills != nil && loader != nil && len(execution.Evidence) > 0 {
+		// 新证据或技能加载可能改变技能匹配方向，因此每轮重建技能上下文。
+		// 整条替换旧的技能上下文消息；技能库异常时保留上一轮知识，
+		// 不能影响事故诊断主流程。
+		// 触发条件用 Executed（确有工具执行）而非 Evidence（load_skill 不产证据）。
+		if r.skills != nil && loader != nil && execution.Executed > 0 {
 			skillMessage, refs, briefs := buildSkillContext(
 				r.skills,
 				buildKnowledgeQuery(
@@ -646,10 +693,7 @@ Do not include Markdown code fences around the JSON.`
 			)
 
 			if skillMessage != "" {
-				messages = append(messages, llm.Message{
-					Role:    "system",
-					Content: skillMessage,
-				})
+				messages = upsertSkillContextMessage(messages, skillMessage)
 			}
 
 			skillRefs = mergeSkillRefs(skillRefs, refs)
@@ -720,8 +764,14 @@ func applyFinalAnswer(report *Report, content string) error {
 	content = stripCodeFences(content)
 
 	var result struct {
-		Summary    string   `json:"summary"`
-		Hypotheses []string `json:"hypotheses"`
+		Summary            string   `json:"summary"`
+		Hypotheses         []string `json:"hypotheses"`
+		ObservedFacts      []string `json:"observed_facts"`
+		SupportingEvidence []string `json:"supporting_evidence"`
+		RefutingEvidence   []string `json:"refuting_evidence"`
+		UnverifiedIssues   []string `json:"unverified_issues"`
+		Confidence         string   `json:"confidence"`
+		NextSteps          []string `json:"next_steps"`
 	}
 
 	if err := json.Unmarshal([]byte(content), &result); err != nil {
@@ -766,6 +816,45 @@ func applyFinalAnswer(report *Report, content string) error {
 
 	report.Summary = result.Summary
 	report.Hypotheses = result.Hypotheses
+
+	// 证据链结构字段：容忍缺失，缺失时归一为空数组。
+	if result.ObservedFacts == nil {
+		result.ObservedFacts = []string{}
+	}
+	if result.SupportingEvidence == nil {
+		result.SupportingEvidence = []string{}
+	}
+	if result.RefutingEvidence == nil {
+		result.RefutingEvidence = []string{}
+	}
+	if result.UnverifiedIssues == nil {
+		result.UnverifiedIssues = []string{}
+	}
+	if result.NextSteps == nil {
+		result.NextSteps = []string{}
+	}
+	for i, item := range result.ObservedFacts {
+		result.ObservedFacts[i] = strings.TrimSpace(item)
+	}
+	for i, item := range result.SupportingEvidence {
+		result.SupportingEvidence[i] = strings.TrimSpace(item)
+	}
+	for i, item := range result.RefutingEvidence {
+		result.RefutingEvidence[i] = strings.TrimSpace(item)
+	}
+	for i, item := range result.UnverifiedIssues {
+		result.UnverifiedIssues[i] = strings.TrimSpace(item)
+	}
+	for i, item := range result.NextSteps {
+		result.NextSteps[i] = strings.TrimSpace(item)
+	}
+
+	report.ObservedFacts = result.ObservedFacts
+	report.SupportingEvidence = result.SupportingEvidence
+	report.RefutingEvidence = result.RefutingEvidence
+	report.UnverifiedIssues = result.UnverifiedIssues
+	report.Confidence = strings.TrimSpace(result.Confidence)
+	report.NextSteps = result.NextSteps
 	return nil
 }
 

@@ -4,11 +4,43 @@ import (
 	"encoding/json"
 	"strings"
 
+	"github.com/liocoder/TraceMind/internal/llm"
 	"github.com/liocoder/TraceMind/internal/skills"
 )
 
 // maxLoadedSkills 是单次事件调查中允许同时加载的技能数（L3 全量预算）。
 const maxLoadedSkills = 2
+
+// skillContextMarker 标记"当前技能上下文"这条 system 消息。
+// 每轮调查后整条替换，保证 LRU 淘汰、模型可见上下文与报告记录三者一致：
+// 被淘汰技能的旧正文不会残留在对话历史中重复占用 token。
+const skillContextMarker = "[TraceMind skill context]"
+
+// upsertSkillContextMessage 用最新的技能上下文替换 messages 中旧的技能上下文消息。
+// 内容为空时不作任何修改。
+func upsertSkillContextMessage(
+	messages []llm.Message,
+	content string,
+) []llm.Message {
+	if content == "" {
+		return messages
+	}
+
+	marked := skillContextMarker + "\n" + content
+
+	filtered := make([]llm.Message, 0, len(messages)+1)
+	for _, message := range messages {
+		if strings.HasPrefix(message.Content, skillContextMarker) {
+			continue
+		}
+		filtered = append(filtered, message)
+	}
+
+	return append(filtered, llm.Message{
+		Role:    "system",
+		Content: marked,
+	})
+}
 
 // SkillReference 记录调查过程中实际使用的技能来源，供报告审计。
 // 技能属于参考知识，不属于 Evidence，不参与当前事故证据计数。

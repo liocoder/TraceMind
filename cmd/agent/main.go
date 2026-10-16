@@ -47,6 +47,16 @@ func main() {
 		"skills",
 		"Path to the investigation skills directory",
 	)
+	noSkills := flag.Bool(
+		"no-skills",
+		false,
+		"Disable the skills library (ablation baseline)",
+	)
+	singleShot := flag.Bool(
+		"single-shot",
+		false,
+		"Single-round LLM baseline without tools (ablation baseline)",
+	)
 	flag.Parse()
 
 	incident := strings.TrimSpace(*incidentFlag)
@@ -82,11 +92,6 @@ func main() {
 		log.Fatalf("initialize mock provider: %v", err)
 	}
 
-	library, err := skills.Load(*skillsPath)
-	if err != nil {
-		log.Fatalf("initialize skills library: %v", err)
-	}
-
 	registry := tool.NewRegistry()
 
 	if err := registry.Register(tool.NewLogsSearchTool(provider)); err != nil {
@@ -97,12 +102,27 @@ func main() {
 		log.Fatalf("register metrics tool: %v", err)
 	}
 
-	if err := registry.Register(tool.NewLoadSkillTool(library)); err != nil {
-		log.Fatalf("register load_skill tool: %v", err)
+	runtime := agent.NewRuntime(registry, client)
+
+	// 消融基线开关：
+	// -no-skills   关闭技能库与 load_skill 工具（对照"无 Skill 多轮 Agent"）
+	// -single-shot 单轮 LLM 基线，不经规划与工具调查直接输出诊断
+	if !*noSkills && !*singleShot {
+		library, err := skills.Load(*skillsPath)
+		if err != nil {
+			log.Fatalf("initialize skills library: %v", err)
+		}
+
+		if err := registry.Register(tool.NewLoadSkillTool(library)); err != nil {
+			log.Fatalf("register load_skill tool: %v", err)
+		}
+
+		runtime.SetSkillsLibrary(library)
 	}
 
-	runtime := agent.NewRuntime(registry, client)
-	runtime.SetSkillsLibrary(library)
+	if *singleShot {
+		runtime.SetSingleShot(true)
+	}
 
 	if cfg.Agent.MaxToolCalls > 0 {
 		runtime.SetMaxToolCalls(cfg.Agent.MaxToolCalls)

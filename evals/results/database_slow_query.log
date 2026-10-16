@@ -4,48 +4,30 @@ Mock scenario: database_slow_query
 
 [TraceMind] tool=query_metrics arguments={"service": "order-service"}
 [TraceMind] result=service=order-service, timestamp=2026-10-15T10:30:00Z, status=degraded, connection_pool_usage=94%, cpu_usage=45%, error_rate=7%, p95_latency_ms=2800ms
-[TraceMind] tool=search_logs arguments={"query": "connection pool exhaustion timeout acquiring connection order-service"}
+[TraceMind] tool=search_logs arguments={"query": "order-service connection pool exhaustion timeout acquiring connection"}
 [TraceMind] result=2026-10-15T10:30:02Z ERROR service=order-service database query timeout while processing order
-[TraceMind] tool=load_skill arguments={"name": "database_latency"}
-[TraceMind] result=# 数据库延迟升高与查询异常
-
-## 适用场景
-
-当业务服务出现请求超时、HTTP 502、接口延迟升高或数据库相关错误时，可以参考本文排查数据库是否是故障原因。
-
-本文是通用排查指南，不代表当前事故一定由数据库引起。
+[TraceMind] tool=load_skill arguments={"name": "connection_pool"}
+[TraceMind] result=# 连接池耗尽导致请求超时
 
 ## 典型表现
 
-- 数据库查询延迟升高，尤其是 P95、P99 等高分位延迟。
-- 数据库连接建立失败、连接获取超时或连接池等待增加。
-- 慢查询、锁等待、死锁或事务执行时间明显增加。
-- 数据库 CPU、I/O、活动连接数等资源指标异常。
-- 上游业务请求超时与数据库异常在时间上存在关联。
+- 数据库连接池的活跃连接数持续接近最大连接数。
+- 等待连接的请求增加，获取连接的耗时升高。
+- 业务接口出现超时，但不一定意味着数据库本身已经发生故障。
 
 ## 调查步骤
 
-1. 检查数据库连接状态、活动连接数、连接等待和连接获取错误。
-2. 检查查询延迟、慢查询、锁等待和事务异常。
-3. 对比数据库指标和业务服务延迟、错误率的变化时间。
-4. 检查连接池配置、连接泄漏以及数据库连接是否被长事务占用。
-5. 如果数据库指标正常，继续检查下游依赖、网络、线程池、请求队列及其他资源瓶颈。
-
-## 区分数据库故障与连接池故障
-
-连接池耗尽不一定意味着数据库本身异常。
-
-如果连接池等待显著增加，但数据库查询延迟和数据库资源使用率正常，需要进一步调查连接泄漏、连接未释放、连接池容量不足或并发请求激增。
-
-如果数据库查询延迟、锁等待或资源使用率同时异常，才有更充分的理由进一步怀疑数据库内部问题。
+1. 查询连接池活跃连接数、空闲连接数、等待连接数及连接获取耗时。
+2. 搜索连接获取超时、连接泄漏、连接未及时释放等日志。
+3. 对比业务请求量、数据库查询延迟与连接池指标的时间变化。
+4. 如果连接池指标正常，应继续排查下游依赖、慢查询或其他资源瓶颈。
 
 ## 判断原则
 
-- 数据库延迟升高与业务超时同时发生，只能说明二者存在关联。
-- 必须结合时间顺序、请求链路和实际观测判断因果关系。
-- 如果没有数据库专项观测，不能仅凭业务日志确认数据库根因。
-- 如果数据库指标正常，应保留并调查其他候选原因，而不是强行确认数据库故障。
-[TraceMind] skill loaded="database_latency"
+连接池耗尽是候选原因，不是看到接口超时后就能确认的根因。
+
+只有当前事故的观测数据支持这一解释时，才能提高该假设的可信度。
+[TraceMind] skill loaded="connection_pool"
 {
   "incident": "Order requests are slow and sometimes time out. Investigate the likely cause.",
   "state": "completed",
@@ -64,115 +46,111 @@ Mock scenario: database_slow_query
     "completed"
   ],
   "tool_calls": 3,
-  "summary": "Order-service is in a degraded state: metrics show status=degraded, p95_latency=2800ms, error_rate=7%, connection_pool_usage=94%, and cpu_usage=45% (2026-10-15T10:30:00Z). Logs show a database query timeout while processing an order at the same time, confirming that order requests are timing out with at least one database query timeout error. CPU is only moderately utilized, so a compute-bound cause is not indicated. Two leading candidates remain unresolved: (1) connection pool saturation — pool usage is near capacity (94%) while CPU is moderate, which is consistent with connection contention; and (2) database-side slowness — a query timeout error occurred, which could be the origin rather than the effect. The available evidence is observational and correlational: it cannot establish causal direction between the high pool usage and the database query timeout, nor does it include database-side metrics (query latency, lock waits, active connections), pool wait/queue counts, the pool's underlying resource type, connection leak indicators, or downstream dependency signals. Therefore no root cause is confirmed. Notably, cpu_usage of 45% rules out saturation of CPU as the primary driver, but this does not distinguish between the pool and database hypotheses.",
+  "summary": "The order-service is degraded (status=degraded, error_rate=7%, p95_latency_ms=2800ms, cpu_usage=45%) with connection_pool_usage at 94%. Logs show a database query timeout while processing an order. Two competing explanations remain and neither is confirmed: (a) connection pool saturation delaying/failing connection acquisition, or (b) database-side query slowness that holds connections longer and secondarily drives pool utilization up. CPU at 45% does not indicate CPU saturation. The observed data are consistent with a connection-path or database-query bottleneck, but does not establish which is the root cause; the pool may be a symptom rather than the cause. Root cause remains unverified.",
   "hypotheses": [
-    "Database-side slowness (slow queries, lock waits, or a saturated database) is causing query timeouts, elevated p95 latency, and errors in order-service; the 94% connection pool usage could be a downstream effect of connections being held while awaiting slow queries.",
-    "Connection pool saturation is the primary cause: pool usage near capacity (94%) is causing requests to wait for connections and time out, with the database query timeout being a symptom rather than the origin.",
-    "A connection-handling problem independent of database health (insufficient pool capacity, connections not released, a connection leak, or a surge in concurrent requests) is exhausting the pool, consistent with high pool usage despite moderate CPU.",
-    "A downstream dependency of order-service is slow or unresponsive, causing timeouts and latency that secondarily increase connection pool and database pressure; this remains unverified as no downstream metrics or traces were collected."
+    "Connection pool saturation in order-service: pool near capacity (94%) causes queueing/delays in acquiring connections, leading to slow and failing order requests.",
+    "Database-side query execution slowdown or contention: slow queries extend request processing and hold connections longer, which could both cause timeouts and secondarily raise connection_pool_usage.",
+    "A downstream dependency or other resource bottleneck is causing the timeouts (not yet investigated)."
   ],
   "evidence": [
     {
       "id": "ev-001",
       "source": "metrics-provider",
       "content": "service=order-service, timestamp=2026-10-15T10:30:00Z, status=degraded, connection_pool_usage=94%, cpu_usage=45%, error_rate=7%, p95_latency_ms=2800ms",
-      "created_at": "2026-10-15T13:05:26.5453394Z"
+      "created_at": "2026-10-16T05:28:33.9663453Z"
     },
     {
       "id": "ev-002",
       "source": "logs-provider",
       "content": "2026-10-15T10:30:02Z ERROR service=order-service database query timeout while processing order",
-      "created_at": "2026-10-15T13:05:31.1009488Z"
-    },
-    {
-      "id": "ev-003",
-      "source": "skills-library",
-      "content": "# 数据库延迟升高与查询异常\r\n\r\n## 适用场景\r\n\r\n当业务服务出现请求超时、HTTP 502、接口延迟升高或数据库相关错误时，可以参考本文排查数据库是否是故障原因。\r\n\r\n本文是通用排查指南，不代表当前事故一定由数据库引起。\r\n\r\n## 典型表现\r\n\r\n- 数据库查询延迟升高，尤其是 P95、P99 等高分位延迟。\r\n- 数据库连接建立失败、连接获取超时或连接池等待增加。\r\n- 慢查询、锁等待、死锁或事务执行时间明显增加。\r\n- 数据库 CPU、I/O、活动连接数等资源指标异常。\r\n- 上游业务请求超时与数据库异常在时间上存在关联。\r\n\r\n## 调查步骤\r\n\r\n1. 检查数据库连接状态、活动连接数、连接等待和连接获取错误。\r\n2. 检查查询延迟、慢查询、锁等待和事务异常。\r\n3. 对比数据库指标和业务服务延迟、错误率的变化时间。\r\n4. 检查连接池配置、连接泄漏以及数据库连接是否被长事务占用。\r\n5. 如果数据库指标正常，继续检查下游依赖、网络、线程池、请求队列及其他资源瓶颈。\r\n\r\n## 区分数据库故障与连接池故障\r\n\r\n连接池耗尽不一定意味着数据库本身异常。\r\n\r\n如果连接池等待显著增加，但数据库查询延迟和数据库资源使用率正常，需要进一步调查连接泄漏、连接未释放、连接池容量不足或并发请求激增。\r\n\r\n如果数据库查询延迟、锁等待或资源使用率同时异常，才有更充分的理由进一步怀疑数据库内部问题。\r\n\r\n## 判断原则\r\n\r\n- 数据库延迟升高与业务超时同时发生，只能说明二者存在关联。\r\n- 必须结合时间顺序、请求链路和实际观测判断因果关系。\r\n- 如果没有数据库专项观测，不能仅凭业务日志确认数据库根因。\r\n- 如果数据库指标正常，应保留并调查其他候选原因，而不是强行确认数据库故障。",
-      "created_at": "2026-10-15T13:05:36.5096181Z"
+      "created_at": "2026-10-16T05:28:38.7584939Z"
     }
   ],
   "plans": [
     {
       "tool_name": "query_metrics",
-      "rationale": "The incident reports slow and timing out order requests, but no evidence or hypotheses exist yet. Querying metrics for the order service is the most direct way to observe latency, error, and saturation signals and form testable hypotheses.",
-      "expected_observation": "Order service metrics showing elevated latency, timeout/error rates, throughput, or resource saturation that indicates where the bottleneck lies."
+      "rationale": "No observations have been collected yet. Querying service health metrics for the order service is the most direct way to identify anomalies (latency, error rate, saturation, timeouts) that explain slow and timing-out order requests.",
+      "expected_observation": "Metrics for the order service showing elevated latency, error rates, resource saturation, or timeout counts, and potentially identifying a downstream dependency causing degradation."
     },
     {
       "tool_name": "search_logs",
-      "rationale": "Metrics already confirm degraded state and 94% pool usage, but cannot distinguish pool exhaustion/queueing from other causes. Logs can reveal explicit connection-acquisition timeouts, pool-exhaustion warnings, or errors that establish causation and identify the pool resource.",
-      "target_hypothesis_id": "hyp-3c1a9d72",
-      "expected_observation": "Log entries showing connection pool timeout/exhaustion errors, waiting-for-connection messages, or connection acquisition failures correlating with the 7% error rate and slow requests."
+      "rationale": "The metrics show high connection pool usage but cannot confirm the causal mechanism (pool exhaustion, connection acquisition timeouts, queueing). Searching logs for connection pool related errors will directly test whether requests are failing/slow due to connection acquisition rather than some other cause.",
+      "target_hypothesis_id": "hyp-1a2b3c4d",
+      "expected_observation": "Log entries showing connection pool exhaustion, timeout waiting for a connection, or connection acquisition failures in order-service, which would confirm the connection pool saturation hypothesis."
     },
     {
       "tool_name": "load_skill",
-      "rationale": "Two competing hypotheses remain: database latency (hyp-1d9f4b20) versus connection pool saturation (hyp-3c1a9d72). Existing metrics/logs are already collected, and the summaries for 'database_latency' and 'connection_pool' are too high-level to know which additional metrics or log patterns would discriminate them. Loading the most relevant skill will reveal the specific diagnostic signals to query next.",
-      "target_hypothesis_id": "hyp-1d9f4b20",
-      "expected_observation": "Detailed diagnostic guidance (specific metrics, thresholds, or log patterns) that distinguishes database-side slowness from connection pool saturation, enabling a targeted follow-up query."
+      "rationale": "Two competing hypotheses remain: connection pool saturation vs database-side query slowdown. The available skills 'connection_pool' (database connection pool exhaustion causing timeouts) and 'database_latency' (database latency/slow queries) map directly to these hypotheses. Their L2 summaries are too terse to know which discriminating signals (e.g., pool wait time, active/idle connections, DB query latency, lock waits) to look for, so loading the full skill will sharpen the next metrics/log queries to distinguish the two.",
+      "expected_observation": "Detailed diagnostic guidance distinguishing pool saturation from database-side query slowdown, including specific metrics/log patterns (e.g., connection acquisition wait time, active vs idle connections, DB-side query duration) that the next query_metrics or search_logs call should target."
     }
   ],
   "diagnosis_hypotheses": [
     {
-      "id": "hyp-1d9f4b20",
-      "title": "Slow or unresponsive database queries may be causing order-service degradation",
-      "description": "Order-service logs show a database query timeout while processing an order, coinciding with the degraded state, elevated p95 latency, and elevated error rate. This suggests that slow responses from a database dependency could be a direct cause of the timeouts and latency. The connection_pool_usage at 94% could be a downstream effect of connections being held while waiting on slow queries, rather than the original cause. The available evidence does not include database-side metrics, query plans, or tracing, so the direction of causation and the specific database mechanism remain unverified. The investigation guide (ev-003) explicitly cautions that a database query timeout correlation alone does not confirm the database as the root cause and that database-side observations are required.",
-      "status": "proposed",
-      "confidence": 0.4,
-      "evidence": [
-        {
-          "evidence_id": "ev-001",
-          "relation": "supports",
-          "reason": "Shows order-service as degraded with elevated p95 latency (2800ms), a 7% error rate, and high connection_pool_usage (94%), which is consistent with query timeouts affecting request handling, though it does not establish the database as the origin or identify the pool's resource type."
-        },
-        {
-          "evidence_id": "ev-002",
-          "relation": "supports",
-          "reason": "Directly observes an ERROR log with 'database query timeout while processing order' for order-service, which is consistent with a slow or unresponsive database dependency causing order processing delays and timeouts."
-        },
-        {
-          "evidence_id": "ev-003",
-          "relation": "neutral",
-          "reason": "The guide describes database latency/timeout patterns and investigation steps that match the observed symptoms, but it explicitly states it is generic and does not confirm the current incident is database-caused, so it neither confirms nor rules out this hypothesis."
-        }
-      ]
-    },
-    {
-      "id": "hyp-3c1a9d72",
-      "title": "Connection pool saturation may be contributing to order-service latency",
-      "description": "Order-service is in a degraded state with elevated latency (p95=2800ms), a 7% error rate, and connection_pool_usage at 94%. The high connection pool utilization suggests possible contention for pooled connections, which could plausibly contribute to slow requests and timeouts. However, the pool resource type is not explicitly identified, and the 94% figure alone does not prove exhaustion, queueing, or a leak. CPU usage (45%) appears moderate, so a compute-bound explanation is less likely. The relationship between pool utilization and the observed latency/errors is correlational at this point and would need tracing or more granular metrics to establish causation. Per ev-003, pool exhaustion does not necessarily imply an underlying database fault, and pool wait metrics would be needed to distinguish the two.",
+      "id": "hyp-1a2b3c4d",
+      "title": "Connection pool saturation in order-service",
+      "description": "The order-service is in a degraded state with connection_pool_usage at 94%, suggesting the connection pool is near capacity. High pool utilization may cause delays in acquiring connections, which could plausibly contribute to the elevated p95 latency (2800ms) and 7% error rate. CPU usage at 45% does not indicate CPU saturation, so the connection pool remains the most prominent resource-level signal. However, the evidence does not establish that the pool is exhausted, that connection acquisition is actually queueing, or that this is the root cause rather than a symptom of another bottleneck. The logged database query timeout is consistent with slow query execution or database-side contention, which could itself be the underlying cause driving up pool utilization rather than the pool being the primary cause.",
       "status": "proposed",
       "confidence": 0.45,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "supports",
-          "reason": "Reports order-service as degraded with connection_pool_usage=94%, which is consistent with pool saturation possibly affecting request handling, alongside elevated p95 latency (2800ms) and a 7% error rate."
+          "reason": "Shows order-service is degraded with connection_pool_usage=94%, p95_latency_ms=2800ms, and error_rate=7%, consistent with high connection pool utilization contributing to slow and failing order requests, though exhaustion or queueing is not directly evidenced."
         },
         {
-          "evidence_id": "ev-003",
+          "evidence_id": "ev-002",
           "relation": "neutral",
-          "reason": "The guide notes that connection pool exhaustion can occur without database abnormality and recommends checking connection leaks, unreleased connections, pool capacity, and connection wait metrics, which are not present in the supplied evidence."
+          "reason": "A logged database query timeout is consistent with delays in the connection path but does not identify the pool as the cause; it could equally reflect slow database query execution or database-side contention, so it neither supports nor refutes pool saturation as the driver."
         }
       ]
     },
     {
-      "id": "hyp-8b7e2f41",
-      "title": "Connection pool capacity or connection-handling issue independent of database health",
-      "description": "The elevated connection_pool_usage (94%) together with latency and errors could alternatively reflect a pool-side problem—such as insufficient pool capacity, connections not being released, or increased concurrent demand—rather than a database-internal fault. CPU usage (45%) is moderate, leaving room for a connection-management explanation. However, the evidence does not include pool wait counts, leak indicators, pool configuration, or concurrency metrics, so this remains a plausible alternative rather than a supported cause. It should be treated as a candidate to investigate alongside, not instead of, database health.",
+      "id": "hyp-3f8a1c2e",
+      "title": "Database-side query execution slowdown causing order-service latency and timeouts",
+      "description": "The order-service logs a database query timeout, which may indicate that queries are executing slowly on the database side or that the database is experiencing contention. Slow query execution would prolong request processing, potentially raising p95 latency and error rates in the order-service. Elevated connection_pool_usage could then be a consequence of connections being held longer while queries run, rather than the pool itself being the root bottleneck. This hypothesis is tentative: the evidence does not identify the database vendor, query, resource metrics on the database, or establish that the timeout is the dominant contributor to the observed latency and errors.",
       "status": "proposed",
-      "confidence": 0.3,
+      "confidence": 0.4,
       "evidence": [
         {
           "evidence_id": "ev-001",
           "relation": "supports",
-          "reason": "High connection_pool_usage (94%) concurrent with degraded status, elevated p95 latency, and a 7% error rate is consistent with pool capacity or connection-handling pressure, though it does not distinguish this from database slowness."
+          "reason": "Shows degraded order-service with elevated p95 latency and error rate; if queries are slow, connections would be held longer, which is consistent with the observed 94% connection_pool_usage as a possible consequence rather than a root cause."
         },
         {
-          "evidence_id": "ev-003",
+          "evidence_id": "ev-002",
           "relation": "supports",
-          "reason": "The guide explicitly states that if pool waiting increases while database query latency and resource usage are normal, causes such as connection leaks, unreleased connections, insufficient pool capacity, or a surge in concurrent requests should be investigated."
+          "reason": "Directly logs a database query timeout while processing an order, which is consistent with slow or contended database query execution as a plausible contributor to order-service slowness and timeouts."
         }
       ]
     }
+  ],
+  "observed_facts": [
+    "order-service metrics at 2026-10-15T10:30:00Z: status=degraded, connection_pool_usage=94%, cpu_usage=45%, error_rate=7%, p95_latency_ms=2800ms.",
+    "Log entry at 2026-10-15T10:30:02Z: ERROR service=order-service, database query timeout while processing order."
+  ],
+  "supporting_evidence": [
+    "connection_pool_usage=94% indicates the connection pool is near capacity, consistent with delayed connection acquisition.",
+    "A logged database query timeout while processing an order is consistent with a connection-path or database-query bottleneck.",
+    "Elevated p95_latency (2800ms) and 7% error rate align with slow/failing order requests."
+  ],
+  "refuting_evidence": [
+    "cpu_usage=45% shows no CPU saturation, so the bottleneck is not CPU.",
+    "The logged database query timeout is equally consistent with slow database query execution, so it does not specifically confirm pool exhaustion as the cause.",
+    "No log evidence of connection acquisition timeout, connection leak, or unreleased connections was retrieved to confirm pool exhaustion."
+  ],
+  "unverified_issues": [
+    "Whether the connection pool is actually exhausted or merely highly utilized (active vs idle vs waiting connections, and connection acquisition wait time are unknown).",
+    "Whether database query execution is slow on the DB side (DB query latency, lock waits, DB resource metrics are unknown).",
+    "Whether a downstream dependency is contributing to the timeouts.",
+    "Causal direction: pool saturation causing slowness vs slow DB queries causing high pool utilization."
+  ],
+  "confidence": "low",
+  "next_steps": [
+    "Query connection pool detail metrics: active connections, idle connections, waiting/queued requests, and connection acquisition wait time.",
+    "Query database metrics: query latency (p95/p99), slow query counts, lock waits, and DB resource utilization.",
+    "Search logs for connection acquisition timeouts, connection leaks, or unreleased-connection errors.",
+    "Compare timelines of request volume, DB query latency, and pool metrics to establish causal direction.",
+    "Investigate downstream dependencies if pool and DB-side metrics appear normal."
   ],
   "knowledge": [
     {
@@ -184,11 +162,7 @@ Mock scenario: database_slow_query
       "level": "summary"
     },
     {
-      "name": "downstream_timeout",
-      "level": "summary"
-    },
-    {
-      "name": "database_latency",
+      "name": "connection_pool",
       "level": "full"
     }
   ]

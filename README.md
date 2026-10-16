@@ -6,16 +6,17 @@ TraceMind 不依赖任何 Agent 框架，核心调查循环全部手写（约 4,
 
 ## 特性
 
-- **证据驱动，杜绝编造**：所有结论必须基于工具真实返回的观测；LLM 评估假设时受 17 条证据纪律约束（区分观测与解读、禁止仅凭相关性断定因果、假设 ID 必须对应真实证据等）。
-- **调查纪律强制**：显式状态机（`pending → planning → executing → observing → completed/failed`）；单轮至多执行 1 个工具调用；模型只能调用当前计划允许的工具，违规调用整轮拒绝执行并补齐协议响应；工具调用失败同样计入预算。
+- **证据驱动，杜绝编造**：所有结论必须基于工具真实返回的观测；LLM 评估假设时受 17 条证据纪律约束（区分观测与解读、禁止仅凭相关性断定因果、假设 ID 必须对应真实证据等）。**证据边界强制**：参考知识类工具（`load_skill`）声明 `evidence=false`，执行结果只作为模型可读的 tool 消息、不进入 Evidence Store，领域知识与现场观测在数据模型层隔离。
+- **调查纪律强制**：显式状态机（`pending → planning → executing → observing → completed/failed`）；单轮至多执行 1 个工具调用；模型只能调用当前计划允许的工具，违规调用整轮拒绝执行并补齐协议响应；工具调用失败同样计入预算；**取消与超时贯穿全链路**——Runtime 通过 `PlanContext(ctx)` 把整体取消信号直接传入规划器 LLM 请求。
+- **终局报告证据链结构化**：最终诊断除 `summary`/`hypotheses` 外，输出 `observed_facts` / `supporting_evidence` / `refuting_evidence` / `unverified_issues` / `confidence` / `next_steps`，把"每条结论 ← 哪些证据支持/反驳 ← 哪些未验证"从隐式文本变成显式结构，报告可读也可审计。
 - **预算控制**：单次调查有 `max_tool_calls` 预算（默认 3），预算耗尽后不再向模型暴露工具定义，强制只出最终诊断。
 - **LLM 调用韧性**：429/5xx/网络错误带指数退避重试（最多 2 次）；规划器输出异常（非法 JSON、幻觉工具名、空 rationale 等）**优雅降级**为强制终局而不是整场失败；假设评估失败保留上一轮结果继续调查；模型输出的非严格 JSON（Markdown 围栏、大写 `True`/`False`/`None`、尾逗号）在终局诊断、规划器、假设评估三处统一修复容错。
 - **结构化假设管理**：假设状态机（`proposed / supported / refuted / inconclusive`）、确定性约束校正（支持与反驳并存 → 强制 `inconclusive`）、证据引用完整性校验、基于标题哈希的稳定假设 ID。
-- **三级技能加载机制**：`skills/` 下的 Markdown 技能带结构化 front-matter（`name` / `description` / `triggers` / `recommended_tools`）。L1 技能索引常驻上下文；L2 按事故描述与证据命中触发词注入 2-3 条摘要；L3 由模型通过 `load_skill` 工具主动加载全文，受 `maxLoadedSkills=2` 容量 + LRU 淘汰约束。技能内容是参考知识，明确不作为当前事故证据。
+- **三级技能加载机制**：`skills/` 下的 Markdown 技能带结构化 front-matter（`name` / `description` / `triggers` / `recommended_tools`）。L1 技能索引常驻上下文；L2 按事故描述与证据命中触发词注入 2-3 条摘要；L3 由模型通过 `load_skill` 工具主动加载全文，受 `maxLoadedSkills=2` 容量 + LRU 淘汰约束。技能内容是参考知识，明确不作为当前事故证据。**加载状态、消息上下文与报告记录三者生命周期统一**：每轮用最新技能上下文整条替换旧消息（而非追加），被 LRU 淘汰技能的旧正文不会残留在对话历史中重复占用 token。
 - **Token 预算**：可配置 `max_tokens` 硬上限，基于轻量估算（ASCII ≈ 4 字符/token、CJK ≈ 1 字符/token）累计消息历史与工具定义；超限立即关闭调查并强制最终诊断，防止上下文失控。
 - **可插拔数据源**：`datasource.Provider` 接口（`QueryMetrics` / `SearchLogs`），内置基于 JSON 场景数据的 mock 实现，含服务名别名归一化、时间窗/指标名过滤、日志分词检索。
 - **MCP 能力**：手写 JSON-RPC 2.0 over stdio 最小协议子集（`initialize` / `ping` / `tools/list` / `tools/call` / `shutdown`），任意 MCP 客户端可连接，工具注册即自动暴露（含 `load_skill`）。
-- **可离线演示与评测**：内置 10 个故障场景数据集 + 带关键词断言的评测用例 + 一键批量评测脚本（`evals/run.ps1`）。
+- **可离线演示与评测**：内置 10 个故障场景数据集 + 评测用例 + 一键批量评测脚本（`evals/run.ps1`）。评分按四维合计 100：任务完成（20，正常结束）、根因质量（40，期望关键词命中、违禁词归零）、证据质量（20，结构化假设引用的证据 ID 必须真实存在）、工程效率（20，工具调用数在预算内）。支持三种模式对照：`full`（完整 TraceMind）、`no-skills`（关闭技能库）、`single-shot`（单轮 LLM 基线），用于消融实验证明各机制的净增益。
 
 ## 架构
 
@@ -178,7 +179,7 @@ go run ./cmd/agent \
   -scenario connection_pool_exhaustion
 ```
 
-Agent 会在终端打印每轮的工具调用与结果，最后输出完整 JSON 诊断报告（`incident`、`state`、`state_history`、`tool_calls`、`summary`、`hypotheses`、`evidence`、`plans`、`diagnosis_hypotheses`、`knowledge`——`knowledge` 记录实际使用过的技能与加载级别）。
+Agent 会在终端打印每轮的工具调用与结果，最后输出完整 JSON 诊断报告（`incident`、`state`、`state_history`、`tool_calls`、`summary`、`hypotheses`、`evidence`、`plans`、`diagnosis_hypotheses`、`knowledge`，以及终局证据链结构 `observed_facts` / `supporting_evidence` / `refuting_evidence` / `unverified_issues` / `confidence` / `next_steps`——`knowledge` 记录实际使用过的技能与加载级别）。
 
 ### 3. 工具层演示
 
@@ -254,13 +255,31 @@ go vet ./...
 
 ### 评测用例（`evals/datasets/cases.json`）
 
-每个 case 声明事故描述、`expected_keywords`（诊断必须命中的关键词）、`forbidden_keywords`（诊断不得出现的错误结论）与 `expected_tool_calls_max`（预算上限），用于对 Agent 输出做断言式评测。`evals/results/summary.json` 是示例运行结果（命中/得分/工具调用数/状态）。
+每个 case 声明事故描述、`expected_keywords`（诊断必须命中的关键词）、`forbidden_keywords`（诊断不得出现的错误结论）与 `expected_tool_calls_max`（预算上限），用于对 Agent 输出做断言式评测。评分按四维合计 100：
+
+| 维度 | 分值 | 判定 |
+| --- | --- | --- |
+| 任务完成 | 20 | 正常结束（`state=completed`）且产出报告 |
+| 根因质量 | 40 | 命中任一期望关键词 +40；命中违禁词则该维度归零 |
+| 证据质量 | 20 | 结构化假设引用的 `evidence_id` 全部真实存在于报告证据列表；未输出结构化假设给中性分 |
+| 工程效率 | 20 | 工具调用数 ≤ 预算 +20，每超 1 扣 5，最低 0 |
+
+`evals/results/summary.json` 是示例运行结果（命中/四维得分/工具调用数/状态）。
 
 在项目目录运行以下命令即可跑所有 case（会逐条调用真实 LLM，请先配置 API Key）：
 
 ```
 powershell -ExecutionPolicy Bypass -File .\evals\run.ps1
 ```
+
+**消融基线对照**（用于证明 Skill / 多轮调查机制的净增益）：
+
+```
+powershell -ExecutionPolicy Bypass -File .\evals\run.ps1 -Mode no-skills    # 关闭技能库
+powershell -ExecutionPolicy Bypass -File .\evals\run.ps1 -Mode single-shot  # 单轮 LLM 基线
+```
+
+非 `full` 模式的结果写入 `evals/results/<mode>/`，与完整模式隔离；对比三份 `summary.csv` 即可观察质量（根因命中）与成本（工具调用数）的差异。
 
 脚本设置 `$ErrorActionPreference=Continue`：单个 case 的 stderr 输出（如部分报告、降级告警）不会中断评测，每个 case 都会先写入 `results/<case>.log` 再判定退出码，失败 case 计入 CSV/JSON 汇总后继续下一个。
 
@@ -308,7 +327,7 @@ L3 的约束：
 
 ### 规划器（LLM Planner）
 
-`LLMPlanner` 每轮单独调用 LLM 决策下一步，只返回 JSON 计划（`action: CALL_TOOL | NO_ACTION`、`tool_name`、`rationale`、`target_hypothesis_id`、`expected_observation`），**规划与执行分离**：模型只负责提计划，工具是否执行由 Runtime 校验。规划输入包含当前证据、假设列表、各工具已调用次数与技能摘要（L2/L3 命中项）；`NO_ACTION` 触发强制终局。`Planner` 是接口，可替换为规则规划器或离线策略。
+`LLMPlanner` 每轮单独调用 LLM 决策下一步，只返回 JSON 计划（`action: CALL_TOOL | NO_ACTION`、`tool_name`、`rationale`、`target_hypothesis_id`、`expected_observation`），**规划与执行分离**：模型只负责提计划，工具是否执行由 Runtime 校验。规划输入包含当前证据、假设列表、各工具已调用次数与技能摘要（L2/L3 命中项）；`NO_ACTION` 触发强制终局。`Planner` 是接口，可替换为规则规划器或离线策略；Runtime 通过 `PlanContext(ctx)` 调用，整体取消/超时信号直接贯穿规划请求。
 
 ### 计划强制与预算
 
@@ -321,7 +340,7 @@ L3 的约束：
 
 ### 证据与假设评估
 
-工具结果先写入证据存储（ID 重编为 `ev-001` 起，重复 ID 拒绝，并发安全），再触发假设评估。评估提示词含 17 条纪律，例如：观测不等于指令、高利用率不等于已耗尽、时间邻近不等于因果、`supported` 不代表因果已证实、不得引用不存在的证据 ID、禁止 Markdown 围栏等。
+工具结果先写入证据存储（ID 重编为 `ev-001` 起，重复 ID 拒绝，并发安全），再触发假设评估。**参考知识工具（`load_skill`）的结果被排除在证据生成之外**（`Metadata["evidence"]=="false"`）：它仍然以 tool 消息形式返回给模型，但不会进入 Evidence Store、不会触发假设评估，从数据模型层杜绝"应该查什么"被当成"已经观察到什么"。评估提示词含 17 条纪律，例如：观测不等于指令、高利用率不等于已耗尽、时间邻近不等于因果、`supported` 不代表因果已证实、不得引用不存在的证据 ID、禁止 Markdown 围栏等。
 
 评估结果进一步经过**确定性约束**校正（`constrainHypothesisAssessment`）：
 
@@ -331,7 +350,7 @@ L3 的约束：
 
 ### 技能上下文组装
 
-`internal/agent` 的 `buildSkillContext` 负责把 L2 摘要与已加载的 L3 全文拼成每轮的技能上下文；`skillLoader` 实现容量 + LRU 淘汰；`Report.Knowledge` 记录实际使用的技能与级别（`summary` / `full`），供报告审计。技能上下文随新证据每轮刷新（重新命中触发词），已加载技能在容量内保持。
+`internal/agent` 的 `buildSkillContext` 负责把 L2 摘要与已加载的 L3 全文拼成每轮的技能上下文；`skillLoader` 实现容量 + LRU 淘汰；`Report.Knowledge` 记录实际使用的技能与级别（`summary` / `full`），供报告审计。技能上下文随工具执行（含 `load_skill` 本身）每轮**整条替换**（`upsertSkillContextMessage`，而非追加）：旧的技能上下文消息按固定标记移除后再写入最新版本，保证被 LRU 淘汰的技能正文不会残留在对话历史中，加载状态、模型可见上下文与报告记录三者一致。
 
 ### MCP 能力
 
@@ -368,7 +387,7 @@ L3 的约束：
 
 | 包                | 覆盖点                                                                                  |
 | ---------------- | ------------------------------------------------------------------------------------ |
-| `internal/agent` | 状态机迁移合法性；规划器校验（空工具/非法工具/未知假设 ID）；运行时主循环（计划强制、预算、证据编号、终局报告）；假设评估（确定性约束、证据引用校验、ID 稳定性）；技能加载器 LRU 淘汰与刷新；技能上下文组装（L2 命中/L3 全量/无命中不注入）；token 估算（ASCII/CJK/消息/工具定义）；韧性路径（规划器降级不失败、配置错误仍失败、终局 JSON 围栏容忍、JSON 修复：大写布尔/None/尾逗号且不改字符串内容） |
+| `internal/agent` | 状态机迁移合法性；规划器校验（空工具/非法工具/未知假设 ID）；运行时主循环（计划强制、预算、证据编号、终局报告）；**证据边界（`evidence=false` 工具结果不进证据存储但可达模型）**；**技能上下文整条替换（LRU 淘汰后旧正文不残留）**；**Context 取消贯穿规划器**；**single-shot 基线（不规划不执行工具）**；**终局报告证据链结构字段解析与默认值**；假设评估（确定性约束、证据引用校验、ID 稳定性）；技能加载器 LRU 淘汰与刷新；token 估算；韧性路径（规划器降级不失败、配置错误仍失败、终局 JSON 围栏容忍、JSON 修复：大写布尔/None/尾逗号且不改字符串内容） |
 | `internal/skills`| front-matter 解析（含缺 name 报错）；重名与空目录报错；L1 索引内容；中英文/大小写触发词匹配；无命中；全量正文读取 |
 | `internal/llm`   | 重试：429/5xx 重试成功、401 不重试、网络错误重试、上下文取消中断重试循环；可重试错误分类 |
 | `internal/mcp`   | 协议端到端：握手、握手门、列工具、调工具、未知工具、非法参数、未知方法、解析错误、ping、shutdown                               |
@@ -384,7 +403,9 @@ go test ./... -v
 - **技能检索为简单匹配**：`Library.Match` 是包含匹配，未做同义词/模糊扩展；技能库规模增大后 L1 索引的常驻成本会上升，可考虑按需裁剪。
 - **token 估算为近似**：适用于硬上限控制；若要与模型真实计费对齐，应接入具体模型分词器。
 - **MCP 仅 stdio 本地**：无鉴权/OAuth、无 streamable HTTP transport、无外部 server 注册中心（均为有意的范围裁剪）。
-- **评测未接入 CI**：`evals/run.ps1` 已可一键批量评测，但依赖真实 LLM API，尚未接入 CI 与回归基线。
+- **评测未接入 CI**：`evals/run.ps1` 已可一键批量评测并支持消融模式（`full` / `no-skills` / `single-shot`），但依赖真实 LLM API，尚未接入 CI 与回归基线。
+- **证据约束消融未做**：评测支持关闭技能（`-no-skills`）与单轮基线（`-single-shot`），但"关闭证据纪律约束"（假设评估不做确定性校正）的开关尚未实现，可作为下一步实验。
+- **证据质量维度是引用合法性**：四维评分中的"证据质量"检查结构化假设引用的证据 ID 是否真实存在，属于程序可验证的引用合法性；"证据是否真的支持结论"仍需模型判断与人工/关键词校验，语义级证据质量是后续方向。
 - **未添加 LICENSE**：开源前需补充。
 
 ## License

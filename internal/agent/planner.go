@@ -53,6 +53,7 @@ func plannerDegraded(cause error, format string, args ...any) error {
 
 type Planner interface {
 	Plan(input PlanningInput) (InvestigationPlan, error)
+	PlanContext(ctx context.Context, input PlanningInput) (InvestigationPlan, error)
 }
 
 type plannerClient interface {

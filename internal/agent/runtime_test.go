@@ -326,3 +326,44 @@ func TestApplyFinalAnswerRejectsEmptySummary(t *testing.T) {
 		t.Fatalf("expected empty summary, got %q", report.Summary)
 	}
 }
+
+func TestRuntimeSingleShotSkipsPlanningAndTools(t *testing.T) {
+	client := &fakeCompletionClient{
+		complete: func(
+			ctx context.Context,
+			messages []llm.Message,
+			definitions []llm.ToolDefinition,
+		) (*llm.Completion, error) {
+			return &llm.Completion{
+				Message: llm.Message{
+					Role:    "assistant",
+					Content: `{"summary":"direct LLM guess without investigation","hypotheses":[]}`,
+				},
+				FinishReason: "stop",
+			}, nil
+		},
+	}
+
+	runtime := newTestRuntime(t, 3, client)
+	runtime.SetSingleShot(true)
+
+	report, err := runtime.Run(
+		context.Background(),
+		"order service returns HTTP 502",
+	)
+	if err != nil {
+		t.Fatalf("single-shot Run: %v", err)
+	}
+	if report.State != StateCompleted {
+		t.Fatalf("expected StateCompleted, got %q", report.State)
+	}
+	if report.ToolCalls != 0 {
+		t.Fatalf("single-shot must not execute tools, got %d", report.ToolCalls)
+	}
+	if len(report.Plans) != 0 {
+		t.Fatalf("single-shot must not plan, got %+v", report.Plans)
+	}
+	if report.Summary != "direct LLM guess without investigation" {
+		t.Fatalf("unexpected summary %q", report.Summary)
+	}
+}
